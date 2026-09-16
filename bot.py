@@ -14,6 +14,7 @@ import hmac
 import html
 import re
 import uuid
+from decimal import Decimal, InvalidOperation
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from zoneinfo import ZoneInfo
@@ -280,7 +281,8 @@ class HealthHandler(BaseHTTPRequestHandler):
 
             payload = json.loads(self.rfile.read(length).decode("utf-8"))
             transaction_id = str(payload.get("id", "")).strip()
-            amount = int(payload.get("amount", 0))
+            raw_amount = payload.get("amount", 0)
+            amount = int(Decimal(str(raw_amount)))
             currency = str(payload.get("currency", "")).upper()
             status = str(payload.get("status", "")).upper()
             raw_method = payload.get("paymentMethod")
@@ -317,7 +319,7 @@ class HealthHandler(BaseHTTPRequestHandler):
             else:
                 logging.info("Ignored Platega status %s for transaction %s", status, transaction_id)
             self.respond(200, b"ok")
-        except (ValueError, TypeError, json.JSONDecodeError) as exc:
+        except (ValueError, TypeError, InvalidOperation, json.JSONDecodeError) as exc:
             logging.warning("Invalid Platega webhook payload: %s", exc)
             self.respond(400, b"bad request")
         except Exception as exc:
@@ -1372,7 +1374,16 @@ def handle_update(update: dict):
                         send(chat_id, f"❌ {escape_html(parts[1], 100)} не найден.")
                         return
                     db.set_subscription(target_id, sub_type, days)
-                    send(chat_id, f"✅ {sub_type} выдан {target_id} на {days} дней.")
+                    notification = send(
+                        target_id,
+                        "✅ <b>Подписка активирована</b>\n\n"
+                        f"Вам выдана подписка на <b>{days} дней</b>.",
+                        keyboard=main_keyboard(),
+                    )
+                    delivery_note = ""
+                    if not notification.get("ok"):
+                        delivery_note = "\n⚠️ Не удалось уведомить пользователя: бот заблокирован или чат недоступен."
+                    send(chat_id, f"✅ {sub_type} выдан {target_id} на {days} дней.{delivery_note}")
                 except Exception as e:
                     logging.error("Admin /sub failed: %s", e)
                     send(chat_id, "❌ Не удалось выдать подписку. Подробности записаны в лог.")

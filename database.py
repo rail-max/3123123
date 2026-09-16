@@ -837,7 +837,9 @@ def apply_platega_payment(
             SET status = 'CONFIRMED', payment_method = COALESCE(%s, payment_method), confirmed_at = NOW()
             WHERE transaction_id = %s
               AND status = 'PENDING'
-              AND amount = %s
+              -- Platega can include its processing fee in the amount paid by
+              -- the customer. The original invoice price remains the minimum.
+              AND amount <= %s
               AND currency = %s
             RETURNING user_id, plan_id, granted_days
         """, (payment_method, transaction_id, amount, currency.upper()))
