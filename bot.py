@@ -10,6 +10,7 @@ import logging
 import sys
 import os
 import threading
+import tempfile
 import hmac
 import html
 import re
@@ -413,6 +414,52 @@ def send_photo(chat_id, photo_path, caption="", keyboard=None):
     except Exception as exc:
         logging.error("sendPhoto failed for chat_id=%s path=%s: %s", chat_id, photo_path, exc)
         return {"ok": False}
+
+
+def send_document_path(chat_id, document_path, caption=""):
+    """Send a locally generated migration archive to the administrator."""
+    boundary = f"----CodexBoundary{int(time.time() * 1000)}"
+    body = bytearray()
+
+    def add_field(name, value):
+        body.extend(f"--{boundary}\r\n".encode())
+        body.extend(f'Content-Disposition: form-data; name="{name}"\r\n\r\n'.encode())
+        body.extend(str(value).encode("utf-8"))
+        body.extend(b"\r\n")
+
+    add_field("chat_id", chat_id)
+    if caption:
+        add_field("caption", caption)
+        add_field("parse_mode", "HTML")
+    with open(document_path, "rb") as document_file:
+        document_data = document_file.read()
+    filename = os.path.basename(document_path)
+    body.extend(f"--{boundary}\r\n".encode())
+    body.extend(f'Content-Disposition: form-data; name="document"; filename="{filename}"\r\n'.encode())
+    body.extend(b"Content-Type: application/octet-stream\r\n\r\n")
+    body.extend(document_data)
+    body.extend(f"\r\n--{boundary}--\r\n".encode())
+
+    req = urllib.request.Request(
+        f"{BASE}/sendDocument",
+        data=bytes(body),
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=60) as response:
+            return json.loads(response.read())
+    except Exception as exc:
+        logging.error("sendDocument failed for generated file: %s", exc)
+        return {"ok": False, "description": str(exc)}
+
+
+def download_telegram_file(file_id):
+    result = api("getFile", file_id=file_id)
+    file_path = result.get("result", {}).get("file_path")
+    if not file_path:
+        raise ValueError("Telegram did not return the backup file")
+    with urllib.request.urlopen(f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}", timeout=60) as response:
+        return response.read()
 
 
 def send_invoice(chat_id: int, title: str, description: str, payload: str, amount: int):
@@ -932,6 +979,63 @@ def handle_update(update: dict):
                 send(chat_id, "✅ Режим обращения в поддержку выключен.", keyboard=main_keyboard())
             else:
                 send(chat_id, "ℹ️ Сейчас режим поддержки не активен.", keyboard=main_keyboard())
+            return
+
+        # One-time migration commands. They are deliberately unavailable in groups.
+        migration_command = text.split("@", 1)[0].strip()
+        if migration_command == "/db_id":
+            send(chat_id, f"Твой Telegram ID: <code>{user_id}</code>")
+            return
+
+        if migration_command in ("/db_export", "/db_import") and user_id != ADMIN_ID:
+            logging.warning("Database migration command denied for user_id=%s; ADMIN_ID=%s", user_id, ADMIN_ID)
+            send(
+                chat_id,
+                "❌ Команда переноса недоступна для этого аккаунта.\n\n"
+                f"Твой ID: <code>{user_id}</code>\n"
+                "Укажи это число в переменной <code>ADMIN_ID</code> нового worker и перезапусти его.",
+            )
+            return
+
+        if migration_command == "/db_export" and user_id == ADMIN_ID:
+            send(chat_id, "⏳ Создаю зашифрованную резервную копию базы...")
+            export_path = None
+            try:
+                blob = db.export_encrypted_backup()
+                with tempfile.NamedTemporaryFile(prefix="dialogdelbot-backup-", suffix=".enc", delete=False) as backup_file:
+                    backup_file.write(blob)
+                    export_path = backup_file.name
+                result = send_document_path(
+                    chat_id,
+                    export_path,
+                    "✅ Зашифрованная копия БД. Не пересылай её другим людям.",
+                )
+                if not result.get("ok"):
+                    raise RuntimeError(result.get("description", "Telegram rejected the archive"))
+            except Exception as exc:
+                logging.exception("Database export failed")
+                send(chat_id, f"❌ Не удалось создать копию БД: {escape_html(str(exc), 300)}")
+            finally:
+                if export_path and os.path.exists(export_path):
+                    os.remove(export_path)
+            return
+
+        if migration_command == "/db_import" and user_id == ADMIN_ID:
+            reply = msg.get("reply_to_message") or {}
+            document = reply.get("document") or {}
+            if not document.get("file_id"):
+                send(chat_id, "❌ Отправь <code>/db_import</code> ответом на файл резервной копии.")
+                return
+            try:
+                file_size = int(document.get("file_size") or 0)
+                if file_size > 20 * 1024 * 1024:
+                    raise ValueError("Файл больше 20 МБ: Telegram Bot API не позволяет боту скачать его")
+                restored = db.import_encrypted_backup(download_telegram_file(document["file_id"]))
+                total = sum(restored.values())
+                send(chat_id, f"✅ База восстановлена. Строк перенесено: <b>{total}</b>.")
+            except Exception as exc:
+                logging.exception("Database import failed")
+                send(chat_id, f"❌ Не удалось восстановить БД: {escape_html(str(exc), 300)}")
             return
 
         if text.startswith("/reply ") and user_id == ADMIN_ID:
