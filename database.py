@@ -2,12 +2,10 @@
 
 import base64
 import hashlib
-import json
 import logging
 import os
 import psycopg2
 import psycopg2.extras
-import zlib
 from psycopg2.pool import ThreadedConnectionPool
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -22,20 +20,6 @@ MSK = ZoneInfo("Europe/Moscow")
 ENCRYPTION_PREFIX = "enc:"
 _FERNET = None
 _POOL = None
-
-# Kept explicit so an export cannot accidentally include PostgreSQL system data.
-BACKUP_TABLES = (
-    "users",
-    "connections",
-    "message_cache",
-    "media_cache",
-    "referrals",
-    "user_settings",
-    "payments",
-    "support_message_links",
-    "tribute_payments",
-    "platega_payments",
-)
 
 
 def now_msk() -> datetime:
@@ -59,76 +43,6 @@ def release_conn(conn):
     if conn.closed:
         return
     _POOL.putconn(conn)
-
-
-def export_encrypted_backup() -> bytes:
-    """Create an encrypted, compressed data-only backup for a one-time migration."""
-    conn = get_conn()
-    try:
-        payload = {"version": 1, "tables": {}}
-        with conn.cursor() as cursor:
-            for table in BACKUP_TABLES:
-                cursor.execute(f"SELECT * FROM {table}")
-                columns = [column.name for column in cursor.description]
-                rows = [list(row) for row in cursor.fetchall()]
-                payload["tables"][table] = {"columns": columns, "rows": rows}
-        raw = json.dumps(payload, ensure_ascii=False, default=_backup_json_value).encode("utf-8")
-        return _get_fernet().encrypt(zlib.compress(raw, level=9))
-    finally:
-        release_conn(conn)
-
-
-def import_encrypted_backup(blob: bytes) -> dict:
-    """Restore a backup made by export_encrypted_backup into the current database."""
-    try:
-        raw = zlib.decompress(_get_fernet().decrypt(blob))
-        payload = json.loads(raw.decode("utf-8"), object_hook=_backup_json_object_hook)
-    except (InvalidToken, OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise ValueError("Backup is invalid or was created with a different APP_MASTER_KEY") from exc
-
-    if payload.get("version") != 1 or set(payload.get("tables", {})) != set(BACKUP_TABLES):
-        raise ValueError("Backup has an unsupported format")
-
-    conn = get_conn()
-    try:
-        with conn.cursor() as cursor:
-            for table in reversed(BACKUP_TABLES):
-                cursor.execute(f"TRUNCATE TABLE {table} RESTART IDENTITY CASCADE")
-
-            restored = {}
-            for table in BACKUP_TABLES:
-                table_data = payload["tables"][table]
-                columns = table_data.get("columns")
-                rows = table_data.get("rows")
-                if not isinstance(columns, list) or not isinstance(rows, list):
-                    raise ValueError(f"Backup table {table} is malformed")
-                if rows:
-                    placeholders = ", ".join(["%s"] * len(columns))
-                    column_names = ", ".join(columns)
-                    cursor.executemany(
-                        f"INSERT INTO {table} ({column_names}) VALUES ({placeholders})",
-                        rows,
-                    )
-                restored[table] = len(rows)
-        conn.commit()
-        return restored
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        release_conn(conn)
-
-
-def _backup_json_value(value):
-    if isinstance(value, datetime):
-        return {"__datetime__": value.isoformat()}
-    raise TypeError(f"Unsupported backup value: {type(value).__name__}")
-
-
-def _backup_json_object_hook(value):
-    if set(value) == {"__datetime__"}:
-        return datetime.fromisoformat(value["__datetime__"])
-    return value
 
 
 def truncate_cached_text(text: str) -> str:
