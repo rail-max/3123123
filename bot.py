@@ -287,12 +287,26 @@ class HealthHandler(BaseHTTPRequestHandler):
             payment_method = int(raw_method) if raw_method is not None else None
             if not transaction_id or not amount or currency != "RUB":
                 raise ValueError("invalid Platega callback payload")
+            logging.info(
+                "Platega callback received: transaction_id=%s status=%s amount=%s currency=%s",
+                transaction_id,
+                status,
+                amount,
+                currency,
+            )
 
             if status == "CONFIRMED":
                 payment = db.apply_platega_payment(transaction_id, amount, currency, payment_method)
                 if payment:
                     user_id, days = payment
                     send(user_id, f"✅ <b>Оплата через Platega прошла!</b>\nПодписка на <b>{days} дней</b> активирована.", keyboard=main_keyboard())
+                else:
+                    logging.warning(
+                        "Platega confirmation was not granted: transaction_id=%s amount=%s currency=%s",
+                        transaction_id,
+                        amount,
+                        currency,
+                    )
             elif status in ("CHARGEBACK", "CHARGEBACKED"):
                 payment = db.refund_platega_payment(transaction_id)
                 if payment:
