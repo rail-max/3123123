@@ -40,4 +40,4 @@ https://<your-public-railway-domain>/tariffs
 
 The current ruble tariff is 30 days for 120 RUB through SBP / QR. Telegram
 Stars tariffs remain available in the bot: 7 days for 45 Stars, 30 days for
-100 Stars, and 365 days for 550 Stars.
+100 Stars, and 365 days for 850 Stars.

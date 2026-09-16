@@ -47,7 +47,7 @@ PRIVACY_IMAGE_PATHS = [
 # Prices in Telegram Stars
 PRICE_WEEKLY = 45
 PRICE_MONTHLY = 100
-PRICE_YEARLY = 550
+PRICE_YEARLY = 850
 PAYMENT_PLANS = {
     "weekly": {"days": 7, "stars": PRICE_WEEKLY, "title": "Подписка 7 дней"},
     "monthly": {"days": 30, "stars": PRICE_MONTHLY, "title": "Подписка 30 дней"},
