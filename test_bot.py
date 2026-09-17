@@ -80,7 +80,6 @@ class BotHandlerTests(unittest.TestCase):
 
     def test_business_reply_media_is_sent_once(self):
         self.db.get_owner_by_connection.return_value = 100
-        self.db.get_connections_count_for_user.side_effect = lambda user_id: 1 if user_id == 300 else 0
         update = {
             "business_message": {
                 "business_connection_id": "conn",
@@ -101,12 +100,11 @@ class BotHandlerTests(unittest.TestCase):
             bot.handle_update(update)
 
         send_reply_media.assert_called_once()
-        self.assertEqual(send_reply_media.call_args.args[0], 300)
+        self.assertEqual(send_reply_media.call_args.args[0], 100)
         self.assertEqual(send_reply_media.call_args.args[1]["photo"][-1]["file_id"], "big-photo")
 
     def test_business_owner_reply_media_is_not_ignored(self):
         self.db.get_owner_by_connection.return_value = 100
-        self.db.get_connections_count_for_user.side_effect = lambda user_id: 1 if user_id == 100 else 0
         update = {
             "business_message": {
                 "business_connection_id": "conn",
@@ -131,7 +129,6 @@ class BotHandlerTests(unittest.TestCase):
 
     def test_business_reply_media_requires_active_subscription(self):
         self.db.get_owner_by_connection.return_value = 100
-        self.db.get_connections_count_for_user.return_value = 1
         self.db.is_sub_active.return_value = False
         self.db.get_referral_count.return_value = 0
         update = {

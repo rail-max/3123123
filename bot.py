@@ -639,23 +639,6 @@ def send_reply_media(chat_id, reply_to_message: dict, caption=""):
     return send_file(chat_id, media_file_id, media_type, caption, fallback_to_upload=True)
 
 
-def get_business_reply_recipient(msg: dict, fallback_owner_id: int):
-    candidates = []
-    sender_id = (msg.get("from") or {}).get("id")
-    chat_id = (msg.get("chat") or {}).get("id")
-    for candidate in (sender_id, chat_id, fallback_owner_id):
-        if candidate and candidate not in candidates:
-            candidates.append(candidate)
-
-    for candidate in candidates:
-        try:
-            if db.get_connections_count_for_user(candidate) > 0:
-                return candidate
-        except Exception as exc:
-            logging.warning("Failed to check active connections for user_id=%s: %s", candidate, exc)
-    return fallback_owner_id
-
-
 def save_support_link_from_result(result: dict, user_id: int):
     if not result or not result.get("ok"):
         return
@@ -1146,6 +1129,9 @@ def handle_update(update: dict):
                 return
 
         if user_id != ADMIN_ID and msg.get("reply_to_message"):
+            if not db.is_sub_active(user_id):
+                send_expired_message(user_id, "deleted", "ботом")
+                return
             result = send_reply_media(chat_id, msg["reply_to_message"])
             if result.get("ok"):
                 return
@@ -1778,9 +1764,8 @@ def handle_update(update: dict):
         if reply_to_message:
             replied_message_id = reply_to_message.get("message_id")
             media_type, media_file_id = get_support_media(reply_to_message)
-            recipient_id = get_business_reply_recipient(msg, owner_id)
-            if media_type and media_file_id and not db.is_sub_active(recipient_id):
-                send_expired_message(recipient_id, "deleted", get_chat_link(msg["chat"]))
+            if media_type and media_file_id and not db.is_sub_active(owner_id):
+                send_expired_message(owner_id, "deleted", get_chat_link(msg["chat"]))
                 return
             if (
                 replied_message_id
@@ -1788,22 +1773,20 @@ def handle_update(update: dict):
                 and mark_business_reply_media_sent(msg["chat"]["id"], replied_message_id, media_file_id)
             ):
                 result = send_reply_media(
-                    recipient_id,
+                    owner_id,
                     reply_to_message,
-                    f"↩️ <b>Медиа из ответа в чате</b>\n👤 {get_chat_link(msg['chat'])}",
                 )
                 if not result.get("ok"):
                     _BUSINESS_REPLY_MEDIA_SENT.pop((msg["chat"]["id"], replied_message_id, media_file_id), None)
                     logging.warning(
-                        "Failed to send business reply media recipient_id=%s owner_id=%s connection_id=%s chat_id=%s message_id=%s",
-                        recipient_id,
+                        "Failed to send business reply media owner_id=%s connection_id=%s chat_id=%s message_id=%s",
                         owner_id,
                         conn_id,
                         msg["chat"]["id"],
                         msg.get("message_id"),
                     )
                     send(
-                        recipient_id,
+                        owner_id,
                         "❌ Не удалось переслать медиа из ответа. "
                         "Файл мог быть слишком большим, одноразовое медиа могло стать недоступным, "
                         "или Telegram не успел отдать файл.",
