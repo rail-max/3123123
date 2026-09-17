@@ -906,23 +906,23 @@ def create_platega_payment(user_id: int) -> tuple[str | None, str | None]:
         return None, "Не удалось создать счёт. Попробуй ещё раз через минуту или напиши в поддержку."
 
 
-def send_expired_message(user_id: int, event_type: str, chat_link: str):
+def expired_details_text(user_id: int, event_type: str = "deleted") -> str:
     ref_link = get_ref_link(user_id)
     ref_count = db.get_referral_count(user_id)
     if event_type == "edited":
         event_text = (
-            f"✏️ <b>В чате с {chat_link} изменено сообщение</b>\n\n"
+            "✏️ <b>Сообщение изменено</b>\n\n"
             "Чтобы видеть содержимое изменённых сообщений, продлите подписку.\n\n"
         )
     else:
         event_text = (
-            f"🗑️ <b>В чате с {chat_link} удалено сообщение</b>\n\n"
-            "Чтобы видеть содержимое удалённых сообщений, продлите подписку.\n\n"
+            "🗑️ <b>Сообщение удалено</b>\n\n"
+            "Чтобы увидеть содержимое удалённого сообщения, продлите подписку.\n\n"
         )
 
-    return send(user_id,
+    return (
         event_text
-        + "⏰ <b>Ваша подписка истекла</b>\n\n"
+        + "⏰ <b>Ваша подписка закончилась</b>\n\n"
         "Для продолжения выберите вариант:\n\n"
         f"👥 <b>Пригласи друга</b> — получи +3 дня бесплатно\n"
         f"Приглашено: {ref_count} чел.\n\n"
@@ -931,17 +931,44 @@ def send_expired_message(user_id: int, event_type: str, chat_link: str):
         f"• 30 дней — {PRICE_MONTHLY} Stars\n"
         f"• 365 дней — {PRICE_YEARLY} Stars\n\n"
         "💳 <b>Оплата в рублях через СБП / QR:</b>\n"
-        "• 30 дней — 120 ₽",
-        keyboard={
-            "inline_keyboard": [
-                [{"text": f"⭐ 7 дней — {PRICE_WEEKLY} Stars", "callback_data": "buy_weekly"}],
-                [{"text": f"⭐ 30 дней — {PRICE_MONTHLY} Stars", "callback_data": "buy_monthly"}],
-                [{"text": f"⭐ 365 дней — {PRICE_YEARLY} Stars", "callback_data": "buy_yearly"}],
-                [{"text": "💳 30 дней — 120 ₽ (СБП / QR)", "callback_data": "buy_platega_monthly"}],
-                [{"text": "👥 Пригласить друга", "url": ref_link}],
-            ]
-        }
+        "• 30 дней — 120 ₽"
     )
+
+
+def expired_payment_keyboard(user_id: int):
+    return {
+        "inline_keyboard": [
+            [{"text": f"⭐ 7 дней — {PRICE_WEEKLY} Stars", "callback_data": "buy_weekly"}],
+            [{"text": f"⭐ 30 дней — {PRICE_MONTHLY} Stars", "callback_data": "buy_monthly"}],
+            [{"text": f"⭐ 365 дней — {PRICE_YEARLY} Stars", "callback_data": "buy_yearly"}],
+            [{"text": "💳 30 дней — 120 ₽ (СБП / QR)", "callback_data": "buy_platega_monthly"}],
+            [{"text": "👥 Пригласить друга", "url": get_ref_link(user_id)}],
+        ]
+    }
+
+
+def send_expired_message(user_id: int, event_type: str, chat_link: str, locked: bool = False):
+    if locked and event_type == "deleted":
+        return send(
+            user_id,
+            f"🗑️ <b>В чате с {chat_link} удалено сообщение</b>\n\n"
+            "Чтобы видеть содержимое удалённых сообщений, продлите подписку.",
+            keyboard={"inline_keyboard": [[{"text": "Показать сообщение", "callback_data": "show_expired_deleted"}]]},
+        )
+
+    if event_type == "edited":
+        text = (
+            f"✏️ <b>В чате с {chat_link} изменено сообщение</b>\n\n"
+            "Чтобы видеть содержимое изменённых сообщений, продлите подписку.\n\n"
+            + expired_details_text(user_id, event_type)
+        )
+    else:
+        text = (
+            f"🗑️ <b>В чате с {chat_link} удалено сообщение</b>\n\n"
+            "Чтобы видеть содержимое удалённых сообщений, продлите подписку.\n\n"
+            + expired_details_text(user_id, event_type)
+        )
+    return send(user_id, text, keyboard=expired_payment_keyboard(user_id))
 
 
 def main_keyboard():
@@ -1130,7 +1157,7 @@ def handle_update(update: dict):
 
         if user_id != ADMIN_ID and msg.get("reply_to_message"):
             if not db.is_sub_active(user_id):
-                send_expired_message(user_id, "deleted", "ботом")
+                send_expired_message(user_id, "deleted", "ботом", locked=True)
                 return
             result = send_reply_media(chat_id, msg["reply_to_message"])
             if result.get("ok"):
@@ -1679,6 +1706,15 @@ def handle_update(update: dict):
                 parse_mode="HTML",
                 reply_markup=keyboard,
             )
+        elif data == "show_expired_deleted":
+            api(
+                "editMessageText",
+                chat_id=cq["message"]["chat"]["id"],
+                message_id=cq["message"]["message_id"],
+                text=expired_details_text(user_id, "deleted"),
+                parse_mode="HTML",
+                reply_markup=expired_payment_keyboard(user_id),
+            )
         elif data == "buy_platega_monthly":
             payment_url, error_message = create_platega_payment(user_id)
             if not payment_url:
@@ -1766,7 +1802,7 @@ def handle_update(update: dict):
             replied_message_id = reply_to_message.get("message_id")
             media_type, media_file_id = get_support_media(reply_to_message)
             if media_type and media_file_id and not db.is_sub_active(owner_id):
-                send_expired_message(owner_id, "deleted", get_chat_link(msg["chat"]))
+                send_expired_message(owner_id, "deleted", get_chat_link(msg["chat"]), locked=True)
                 return
             if (
                 replied_message_id
@@ -1893,7 +1929,7 @@ def handle_update(update: dict):
             return
 
         if not db.is_sub_active(owner_id):
-            send_expired_message(owner_id, "deleted", chat_link)
+            send_expired_message(owner_id, "deleted", chat_link, locked=True)
             return
 
         for item_type, msg_id, cached_item in deleted_items:

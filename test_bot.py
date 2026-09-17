@@ -153,6 +153,26 @@ class BotHandlerTests(unittest.TestCase):
 
         send_reply_media.assert_not_called()
         send_mock.assert_called_once()
+        keyboard = send_mock.call_args.kwargs["keyboard"]
+        self.assertEqual(keyboard["inline_keyboard"][0][0]["callback_data"], "show_expired_deleted")
+
+    def test_show_expired_deleted_callback_displays_payment_options(self):
+        self.db.get_referral_count.return_value = 0
+        update = {
+            "callback_query": {
+                "id": "callback-1",
+                "from": {"id": 100},
+                "data": "show_expired_deleted",
+                "message": {"chat": {"id": 100}, "message_id": 50},
+            }
+        }
+
+        with patch.object(bot, "api", return_value={"ok": True}) as api_mock:
+            bot.handle_update(update)
+
+        edit_call = [call for call in api_mock.call_args_list if call.args and call.args[0] == "editMessageText"][0]
+        self.assertIn("Ваша подписка закончилась", edit_call.kwargs["text"])
+        self.assertEqual(edit_call.kwargs["reply_markup"]["inline_keyboard"][0][0]["callback_data"], "buy_weekly")
 
     def test_incoming_business_reply_does_not_send_expired_notice(self):
         self.db.get_owner_by_connection.return_value = 100
