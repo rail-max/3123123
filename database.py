@@ -100,7 +100,7 @@ def init_db():
             user_id         BIGINT PRIMARY KEY,
             username        TEXT,
             first_name      TEXT,
-            sub_type        TEXT DEFAULT 'trial',
+            sub_type        TEXT DEFAULT 'expired',
             sub_expires     TIMESTAMP,
             sub_remaining_seconds INTEGER DEFAULT 0,
             channel_trial_granted BOOLEAN DEFAULT FALSE,

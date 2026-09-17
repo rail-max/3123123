@@ -1631,7 +1631,7 @@ def handle_update(update: dict):
                 f"<b>Команды:</b>\n\n"
                 f"/sub @user 1|3|7|30|365 — добавить дни подписки\n"
                 f"/ban user_id|@user — забанить пользователя\n"
-                f"/unban user_id|@user — разбанить и дать 14 дней trial\n"
+                f"/unban user_id|@user — разбанить и дать 7 дней trial\n"
                 f"/users [user_id|@user] — список пользователей и поиск\n"
                 f"Кнопка в /users: 🎁 реферальная программа\n"
                 f"/reply user_id текст — ответить в поддержку вручную\n"
@@ -1713,8 +1713,8 @@ def handle_update(update: dict):
                     if not target_id:
                         send(chat_id, "❌ Пользователь не найден. Используй user_id или @username.")
                         return
-                    db.set_subscription(target_id, "trial", 14)
-                    send(chat_id, f"✅ {target_id} разбанен, trial 14 дней.")
+                    db.set_subscription(target_id, "trial", 7)
+                    send(chat_id, f"✅ {target_id} разбанен, trial 7 дней.")
                     try:
                         send(target_id, "✅ Ваш доступ восстановлен.")
                     except Exception:
