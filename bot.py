@@ -9,6 +9,7 @@ import time
 import logging
 import sys
 import os
+import tempfile
 import threading
 import hmac
 import html
@@ -445,7 +446,121 @@ def send_invoice(chat_id: int, title: str, description: str, payload: str, amoun
     return result
 
 
-def send_file(chat_id, file_id, file_type, caption=""):
+MEDIA_UPLOAD_METHODS = {
+    "voice": ("sendVoice", "voice"),
+    "video_note": ("sendVideoNote", "video_note"),
+    "audio": ("sendAudio", "audio"),
+    "photo": ("sendPhoto", "photo"),
+    "video": ("sendVideo", "video"),
+    "animation": ("sendAnimation", "animation"),
+    "document": ("sendDocument", "document"),
+    "sticker": ("sendSticker", "sticker"),
+}
+MEDIA_FILE_SUFFIXES = {
+    "voice": ".ogg",
+    "video_note": ".mp4",
+    "audio": ".mp3",
+    "photo": ".jpg",
+    "video": ".mp4",
+    "animation": ".gif",
+    "document": "",
+    "sticker": ".webp",
+}
+MEDIA_WITHOUT_CAPTION = {"video_note", "sticker"}
+
+
+def send_local_file(chat_id, file_path, file_type, caption=""):
+    if not os.path.exists(file_path):
+        logging.error("send_local_file file not found: %s", file_path)
+        return {"ok": False}
+
+    method, field_name = MEDIA_UPLOAD_METHODS.get(file_type, ("sendDocument", "document"))
+    boundary = f"----CodexBoundary{int(time.time() * 1000)}"
+    body = bytearray()
+
+    def add_field(name, value):
+        body.extend(f"--{boundary}\r\n".encode())
+        body.extend(f'Content-Disposition: form-data; name="{name}"\r\n\r\n'.encode())
+        body.extend(str(value).encode("utf-8"))
+        body.extend(b"\r\n")
+
+    add_field("chat_id", chat_id)
+    if caption and file_type not in MEDIA_WITHOUT_CAPTION:
+        add_field("caption", caption)
+        add_field("parse_mode", "HTML")
+
+    mime_type = mimetypes.guess_type(file_path)[0] or "application/octet-stream"
+    filename = os.path.basename(file_path)
+    with open(file_path, "rb") as media_file:
+        media_data = media_file.read()
+
+    body.extend(f"--{boundary}\r\n".encode())
+    body.extend(f'Content-Disposition: form-data; name="{field_name}"; filename="{filename}"\r\n'.encode())
+    body.extend(f"Content-Type: {mime_type}\r\n\r\n".encode())
+    body.extend(media_data)
+    body.extend(f"\r\n--{boundary}--\r\n".encode())
+
+    req = urllib.request.Request(
+        f"{BASE}/{method}",
+        data=bytes(body),
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r:
+            response = json.loads(r.read().decode("utf-8"))
+            if not response.get("ok"):
+                logging.error("Telegram API returned error for %s upload: %s", method, response)
+            elif caption and file_type in MEDIA_WITHOUT_CAPTION:
+                send(chat_id, caption)
+            return response
+    except Exception as exc:
+        logging.error("send_local_file failed for chat_id=%s file_type=%s path=%s: %s", chat_id, file_type, file_path, exc)
+        return {"ok": False}
+
+
+def download_telegram_file(file_id, file_type):
+    response = api("getFile", file_id=file_id)
+    if not response.get("ok"):
+        logging.error("getFile failed for file_type=%s", file_type)
+        return None
+
+    file_path = response.get("result", {}).get("file_path", "")
+    if not file_path:
+        logging.error("getFile returned empty file_path for file_type=%s", file_type)
+        return None
+
+    suffix = MEDIA_FILE_SUFFIXES.get(file_type, "")
+    temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+    temp_path = temp_file.name
+    temp_file.close()
+
+    file_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{urllib.parse.quote(file_path, safe='/')}"
+    try:
+        urllib.request.urlretrieve(file_url, temp_path)
+        return temp_path
+    except Exception as exc:
+        logging.error("Telegram file download failed for file_type=%s path=%s: %s", file_type, file_path, exc)
+        try:
+            os.unlink(temp_path)
+        except OSError:
+            pass
+        return None
+
+
+def send_downloaded_file(chat_id, file_id, file_type, caption=""):
+    temp_path = download_telegram_file(file_id, file_type)
+    if not temp_path:
+        return {"ok": False}
+    try:
+        return send_local_file(chat_id, temp_path, file_type, caption)
+    finally:
+        try:
+            os.unlink(temp_path)
+        except OSError:
+            pass
+
+
+def send_file(chat_id, file_id, file_type, caption="", fallback_to_upload=False):
     method_map = {
         "voice": "sendVoice",
         "video_note": "sendVideoNote",
@@ -469,6 +584,8 @@ def send_file(chat_id, file_id, file_type, caption=""):
         result = api(method, **params)
     if not result.get("ok"):
         logging.error("send_file failed for chat_id=%s file_type=%s", chat_id, file_type)
+        if fallback_to_upload:
+            return send_downloaded_file(chat_id, file_id, file_type, caption)
     return result
 
 
@@ -979,6 +1096,15 @@ def handle_update(update: dict):
                     send(chat_id, "❌ В ответе нет текста или поддерживаемого файла.")
                     return
                 send(chat_id, f"✅ Ответ отправлен пользователю {target_id}.")
+                return
+
+        if user_id != ADMIN_ID and msg.get("reply_to_message"):
+            reply_to_message = msg["reply_to_message"]
+            media_type, media_file_id = get_support_media(reply_to_message)
+            if media_type and media_file_id:
+                result = send_downloaded_file(chat_id, media_file_id, media_type)
+                if not result.get("ok"):
+                    send(chat_id, "❌ Не удалось получить медиа из сообщения. Возможно, Telegram уже не отдаёт этот файл.")
                 return
 
         if text.startswith("/closesupport ") and user_id == ADMIN_ID:
@@ -1721,7 +1847,13 @@ def handle_update(update: dict):
                 f"🗑️ <b>В чате с {chat_link} удалено медиа</b> · "
                 f"{cached_item['file_type']}\n🕐 {cached_item['date']}"
             )
-            result = send_file(owner_id, cached_item["file_id"], cached_item["file_type"], caption)
+            result = send_file(
+                owner_id,
+                cached_item["file_id"],
+                cached_item["file_type"],
+                caption,
+                fallback_to_upload=True,
+            )
             if result.get("ok"):
                 db.delete_cached_media(conn_id, chat_id, msg_id)
 
