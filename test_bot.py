@@ -78,7 +78,7 @@ class BotHandlerTests(unittest.TestCase):
         self.assertEqual(self.db.cache_message.call_args.args[4], "caption")
         self.assertEqual(self.db.cache_media.call_args.args[5], "video-file")
 
-    def test_business_reply_media_is_sent_once(self):
+    def test_incoming_business_reply_media_is_ignored(self):
         self.db.get_owner_by_connection.return_value = 100
         update = {
             "business_message": {
@@ -99,9 +99,7 @@ class BotHandlerTests(unittest.TestCase):
             bot.handle_update(update)
             bot.handle_update(update)
 
-        send_reply_media.assert_called_once()
-        self.assertEqual(send_reply_media.call_args.args[0], 100)
-        self.assertEqual(send_reply_media.call_args.args[1]["photo"][-1]["file_id"], "big-photo")
+        send_reply_media.assert_not_called()
 
     def test_business_owner_reply_media_is_not_ignored(self):
         self.db.get_owner_by_connection.return_value = 100
@@ -122,9 +120,11 @@ class BotHandlerTests(unittest.TestCase):
 
         with patch.object(bot, "send_reply_media", return_value={"ok": True}) as send_reply_media:
             bot.handle_update(update)
+            bot.handle_update(update)
 
         send_reply_media.assert_called_once()
         self.assertEqual(send_reply_media.call_args.args[0], 100)
+        self.assertIn("удалено сообщение", send_reply_media.call_args.args[2])
         self.db.cache_message.assert_not_called()
 
     def test_business_reply_media_requires_active_subscription(self):
@@ -153,6 +153,32 @@ class BotHandlerTests(unittest.TestCase):
 
         send_reply_media.assert_not_called()
         send_mock.assert_called_once()
+
+    def test_incoming_business_reply_does_not_send_expired_notice(self):
+        self.db.get_owner_by_connection.return_value = 100
+        self.db.is_sub_active.return_value = False
+        update = {
+            "business_message": {
+                "business_connection_id": "conn",
+                "message_id": 12,
+                "date": 1,
+                "chat": {"id": 200, "first_name": "Chat"},
+                "from": {"id": 300, "first_name": "Sender"},
+                "text": "reply",
+                "reply_to_message": {
+                    "message_id": 10,
+                    "voice": {"file_id": "voice-file"},
+                },
+            }
+        }
+
+        with patch.object(bot, "send_reply_media", return_value={"ok": True}) as send_reply_media, patch.object(
+            bot, "send", return_value={"ok": True}
+        ) as send_mock:
+            bot.handle_update(update)
+
+        send_reply_media.assert_not_called()
+        send_mock.assert_not_called()
 
     def test_deleted_cache_is_kept_when_delivery_fails(self):
         self.db.get_owner_by_connection.return_value = 100

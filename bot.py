@@ -1761,7 +1761,8 @@ def handle_update(update: dict):
             return
 
         reply_to_message = msg.get("reply_to_message")
-        if reply_to_message:
+        is_owner_message = sender.get("id") == owner_id
+        if is_owner_message and reply_to_message:
             replied_message_id = reply_to_message.get("message_id")
             media_type, media_file_id = get_support_media(reply_to_message)
             if media_type and media_file_id and not db.is_sub_active(owner_id):
@@ -1775,6 +1776,8 @@ def handle_update(update: dict):
                 result = send_reply_media(
                     owner_id,
                     reply_to_message,
+                    f"🗑️ <b>В чате с {get_chat_link(msg['chat'])} удалено сообщение</b>\n"
+                    f"🕐 {format_ts_msk(reply_to_message.get('date', msg['date']))}",
                 )
                 if not result.get("ok"):
                     _BUSINESS_REPLY_MEDIA_SENT.pop((msg["chat"]["id"], replied_message_id, media_file_id), None)
