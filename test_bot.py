@@ -173,7 +173,7 @@ class BotHandlerTests(unittest.TestCase):
 
         edit_call = [call for call in api_mock.call_args_list if call.args and call.args[0] == "editMessageText"][0]
         self.assertIn("Ваша подписка закончилась", edit_call.kwargs["text"])
-        self.assertEqual(edit_call.kwargs["reply_markup"]["inline_keyboard"][0][0]["callback_data"], "buy_weekly")
+        self.assertEqual(edit_call.kwargs["reply_markup"]["inline_keyboard"][0][0]["callback_data"], "buy_daily")
 
     def test_show_locked_callback_sends_saved_media_after_subscription_is_active(self):
         self.db.is_sub_active.return_value = True
@@ -301,6 +301,41 @@ class BotHandlerTests(unittest.TestCase):
         self.db.apply_stars_purchase.assert_called_once()
         self.db.set_subscription.assert_not_called()
         send_mock.assert_called_once()
+
+    def test_daily_subscription_invoice_uses_35_stars(self):
+        update = {
+            "callback_query": {
+                "id": "callback-1",
+                "from": {"id": 100},
+                "data": "buy_daily",
+                "message": {"chat": {"id": 100}, "message_id": 50},
+            }
+        }
+
+        with patch.object(bot, "api", return_value={"ok": True}) as api_mock:
+            bot.handle_update(update)
+
+        invoice_call = [call for call in api_mock.call_args_list if call.args and call.args[0] == "sendInvoice"][0]
+        self.assertEqual(invoice_call.kwargs["payload"], "daily")
+        self.assertEqual(invoice_call.kwargs["prices"][0]["amount"], 35)
+
+    def test_daily_pre_checkout_is_accepted(self):
+        update = {
+            "pre_checkout_query": {
+                "id": "pcq-1",
+                "from": {"id": 100},
+                "invoice_payload": "daily",
+                "total_amount": 35,
+                "currency": "XTR",
+            }
+        }
+
+        with patch.object(bot, "api", return_value={"ok": True}) as api_mock:
+            bot.handle_update(update)
+
+        checkout_call = api_mock.call_args
+        self.assertEqual(checkout_call.args[0], "answerPreCheckoutQuery")
+        self.assertTrue(checkout_call.kwargs["ok"])
 
     def test_invalid_successful_payment_amount_is_rejected(self):
         update = {

@@ -47,14 +47,17 @@ PRIVACY_IMAGE_PATHS = [
 ]
 
 # Prices in Telegram Stars
+PRICE_DAILY = 35
 PRICE_WEEKLY = 45
 PRICE_MONTHLY = 100
 PRICE_YEARLY = 850
 PAYMENT_PLANS = {
+    "daily": {"days": 1, "stars": PRICE_DAILY, "title": "Подписка 1 день"},
     "weekly": {"days": 7, "stars": PRICE_WEEKLY, "title": "Подписка 7 дней"},
     "monthly": {"days": 30, "stars": PRICE_MONTHLY, "title": "Подписка 30 дней"},
     "yearly": {"days": 365, "stars": PRICE_YEARLY, "title": "Подписка 365 дней"},
 }
+STAR_PLAN_ORDER = ("daily", "weekly", "monthly", "yearly")
 PLATEGA_MONTHLY_PLAN_ID = "platega_monthly"
 PLATEGA_MONTHLY_DAYS = 30
 PLATEGA_MONTHLY_AMOUNT = 120
@@ -269,7 +272,7 @@ def tariffs_page() -> bytes:
 <h2>Оплата в рублях</h2>
 <p><b>30 дней — 120 ₽.</b> Оплата проводится через Platega по СБП / QR-коду. Подписка активируется автоматически после подтверждения оплаты.</p>
 <h2>Оплата Telegram Stars</h2>
-<p>7 дней — {PRICE_WEEKLY} Stars.<br>30 дней — {PRICE_MONTHLY} Stars.<br>365 дней — {PRICE_YEARLY} Stars.</p>
+<p>1 день — {PRICE_DAILY} Stars.<br>7 дней — {PRICE_WEEKLY} Stars.<br>30 дней — {PRICE_MONTHLY} Stars.<br>365 дней — {PRICE_YEARLY} Stars.</p>
 <h2>Поддержка</h2>
 <p>Контакт: {html.escape(support_contact())}.</p>""",
     )
@@ -484,6 +487,22 @@ def send_invoice(chat_id: int, title: str, description: str, payload: str, amoun
     if not result.get("ok"):
         logging.error("sendInvoice failed for chat_id=%s payload=%s amount=%s", chat_id, payload, amount)
     return result
+
+
+def stars_plan_label(payload: str, unit: str = "Stars") -> str:
+    plan = PAYMENT_PLANS[payload]
+    return f"{plan['title'].replace('Подписка ', '')} — {plan['stars']} {unit}"
+
+
+def stars_plan_lines(unit: str = "Stars") -> str:
+    return "\n".join(f"• {stars_plan_label(payload, unit)}" for payload in STAR_PLAN_ORDER)
+
+
+def stars_plan_keyboard_rows():
+    return [
+        [{"text": f"⭐ {stars_plan_label(payload)}", "callback_data": f"buy_{payload}"}]
+        for payload in STAR_PLAN_ORDER
+    ]
 
 
 MEDIA_UPLOAD_METHODS = {
@@ -949,9 +968,7 @@ def expired_details_text(user_id: int, event_type: str = "deleted") -> str:
         f"👥 <b>Пригласи друга</b> — получи +3 дня бесплатно\n"
         f"Приглашено: {ref_count} чел.\n\n"
         "⭐ <b>Оплата через Telegram Stars:</b>\n"
-        f"• 7 дней — {PRICE_WEEKLY} Stars\n"
-        f"• 30 дней — {PRICE_MONTHLY} Stars\n"
-        f"• 365 дней — {PRICE_YEARLY} Stars\n\n"
+        f"{stars_plan_lines()}\n\n"
         "💳 <b>Оплата в рублях через СБП / QR:</b>\n"
         "• 30 дней — 120 ₽"
     )
@@ -959,10 +976,7 @@ def expired_details_text(user_id: int, event_type: str = "deleted") -> str:
 
 def expired_payment_keyboard(user_id: int):
     return {
-        "inline_keyboard": [
-            [{"text": f"⭐ 7 дней — {PRICE_WEEKLY} Stars", "callback_data": "buy_weekly"}],
-            [{"text": f"⭐ 30 дней — {PRICE_MONTHLY} Stars", "callback_data": "buy_monthly"}],
-            [{"text": f"⭐ 365 дней — {PRICE_YEARLY} Stars", "callback_data": "buy_yearly"}],
+        "inline_keyboard": stars_plan_keyboard_rows() + [
             [{"text": "💳 30 дней — 120 ₽ (СБП / QR)", "callback_data": "buy_platega_monthly"}],
             [{"text": "👥 Пригласить друга", "url": get_ref_link(user_id)}],
         ]
@@ -1442,15 +1456,11 @@ def handle_update(update: dict):
         elif text in ("💳 Купить подписку",):
             send(chat_id,
                 f"💳 <b>Купить подписку</b>\n\n"
-                f"⭐ 7 дней — {PRICE_WEEKLY} Telegram Stars\n"
-                f"⭐ 30 дней — {PRICE_MONTHLY} Telegram Stars\n"
-                f"⭐ 365 дней — {PRICE_YEARLY} Telegram Stars\n\n"
+                f"⭐ <b>Telegram Stars:</b>\n"
+                f"{stars_plan_lines('Telegram Stars')}\n\n"
                 "💳 СБП / QR через Platega: 30 дней — 120 ₽",
                 keyboard={
-                    "inline_keyboard": [
-                        [{"text": f"⭐ 7 дней — {PRICE_WEEKLY} Stars", "callback_data": "buy_weekly"}],
-                        [{"text": f"⭐ 30 дней — {PRICE_MONTHLY} Stars", "callback_data": "buy_monthly"}],
-                        [{"text": f"⭐ 365 дней — {PRICE_YEARLY} Stars", "callback_data": "buy_yearly"}],
+                    "inline_keyboard": stars_plan_keyboard_rows() + [
                         [{"text": "💳 30 дней — 120 ₽ (СБП / QR)", "callback_data": "buy_platega_monthly"}],
                     ]
                 }
@@ -1544,7 +1554,7 @@ def handle_update(update: dict):
                 f"🆓 Trial: {trial} | 💳 Платных: {paid} | 🚫 Бан: {banned}\n\n"
                 f"🕐 <b>Последние подключения:</b>{recent_text or ' нет'}\n\n"
                 f"<b>Команды:</b>\n\n"
-                f"/sub @user 3|7|30|365 — добавить дни подписки\n"
+                f"/sub @user 1|3|7|30|365 — добавить дни подписки\n"
                 f"/ban user_id|@user — забанить пользователя\n"
                 f"/unban user_id|@user — разбанить и дать 14 дней trial\n"
                 f"/users [user_id|@user] — список пользователей и поиск\n"
@@ -1569,16 +1579,18 @@ def handle_update(update: dict):
                 try:
                     duration = parts[2].lower()
                     duration_map = {
+                        "1": ("daily", 1),
                         "3": ("manual_3d", 3),
                         "7": ("weekly", 7),
                         "30": ("monthly", 30),
                         "365": ("yearly", 365),
+                        "daily": ("daily", 1),
                         "weekly": ("weekly", 7),
                         "monthly": ("monthly", 30),
                         "yearly": ("yearly", 365),
                     }
                     if duration not in duration_map:
-                        send(chat_id, "❌ Формат: /sub user_id|@user 3|7|30|365")
+                        send(chat_id, "❌ Формат: /sub user_id|@user 1|3|7|30|365")
                         return
                     sub_type, days = duration_map[duration]
                     target_id = resolve_user_identifier(parts[1])
@@ -1800,15 +1812,10 @@ def handle_update(update: dict):
                 "После подтверждения подписка активируется автоматически.",
                 keyboard={"inline_keyboard": [[{"text": "Оплатить 120 ₽", "url": payment_url}]]},
             )
-        elif data == "buy_weekly":
-            plan = PAYMENT_PLANS["weekly"]
-            send_invoice(user_id, plan["title"], "Dialog Spy Bot — 7 дней доступа", "weekly", plan["stars"])
-        elif data == "buy_monthly":
-            plan = PAYMENT_PLANS["monthly"]
-            send_invoice(user_id, plan["title"], "Dialog Spy Bot — 30 дней доступа", "monthly", plan["stars"])
-        elif data == "buy_yearly":
-            plan = PAYMENT_PLANS["yearly"]
-            send_invoice(user_id, plan["title"], "Dialog Spy Bot — 365 дней доступа", "yearly", plan["stars"])
+        elif data.startswith("buy_") and data.replace("buy_", "", 1) in PAYMENT_PLANS:
+            payload = data.replace("buy_", "", 1)
+            plan = PAYMENT_PLANS[payload]
+            send_invoice(user_id, plan["title"], f"Dialog Spy Bot — {plan['title'].lower()} доступа", payload, plan["stars"])
 
     # ── Pre-checkout ───────────────────────────────────────
     elif "pre_checkout_query" in update:
