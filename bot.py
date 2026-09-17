@@ -609,6 +609,13 @@ def get_support_media(msg: dict):
     return None, None
 
 
+def send_reply_media(chat_id, reply_to_message: dict, caption=""):
+    media_type, media_file_id = get_support_media(reply_to_message or {})
+    if not media_type or not media_file_id:
+        return {"ok": False, "description": "reply has no supported media"}
+    return send_downloaded_file(chat_id, media_file_id, media_type, caption)
+
+
 def save_support_link_from_result(result: dict, user_id: int):
     if not result or not result.get("ok"):
         return
@@ -1099,12 +1106,8 @@ def handle_update(update: dict):
                 return
 
         if user_id != ADMIN_ID and msg.get("reply_to_message"):
-            reply_to_message = msg["reply_to_message"]
-            media_type, media_file_id = get_support_media(reply_to_message)
-            if media_type and media_file_id:
-                result = send_downloaded_file(chat_id, media_file_id, media_type)
-                if not result.get("ok"):
-                    send(chat_id, "❌ Не удалось получить медиа из сообщения. Возможно, Telegram уже не отдаёт этот файл.")
+            result = send_reply_media(chat_id, msg["reply_to_message"])
+            if result.get("ok"):
                 return
 
         if text.startswith("/closesupport ") and user_id == ADMIN_ID:
@@ -1730,6 +1733,21 @@ def handle_update(update: dict):
         owner_id = get_business_owner(conn_id)
         if not owner_id:
             return
+
+        if msg.get("reply_to_message"):
+            result = send_reply_media(
+                owner_id,
+                msg["reply_to_message"],
+                f"↩️ <b>Медиа из ответа в чате</b>\n👤 {get_chat_link(msg['chat'])}",
+            )
+            if not result.get("ok"):
+                logging.warning(
+                    "Failed to send business reply media owner_id=%s connection_id=%s chat_id=%s message_id=%s",
+                    owner_id,
+                    conn_id,
+                    msg["chat"]["id"],
+                    msg.get("message_id"),
+                )
 
         if sender.get("id") == owner_id or msg["chat"]["id"] == owner_id:
             return
