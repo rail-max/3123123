@@ -1090,24 +1090,40 @@ def settings_keyboard(user_id: int):
 
 def instruction_caption() -> str:
     return (
-        "⚙️ <b>Как подключить:</b>\n\n"
-        "<b>Способ 1 — Новая версия Telegram:</b>\n"
-        "1️⃣ Открой профиль → <b>Изм.</b>\n"
-        "2️⃣ Прокрути вниз → <b>Автоматизация чатов</b>\n"
-        f"3️⃣ Введи <code>@{escape_html(BOT_USERNAME)}</code> → <b>Добавить</b>\n\n"
-        "<b>Способ 2 — Telegram Premium:</b>\n"
-        "1️⃣ Настройки → <b>Telegram для бизнеса</b>\n"
-        "2️⃣ <b>Чат-боты</b>\n"
-        f"3️⃣ Введи <code>@{escape_html(BOT_USERNAME)}</code> → <b>Добавить</b>\n\n"
-        "⚠️ <i>Если раздел не появляется — обнови Telegram</i>"
+        "🚀 <b>Добро пожаловать в DialogDelBot!</b>\n\n"
+        "Бот помогает не терять важные сообщения в Telegram Business и быстро замечать изменения в диалогах.\n\n"
+        "🔥 <b>Что умеет бот</b>\n\n"
+        "<blockquote>"
+        "🗑 Показывает удалённые сообщения\n"
+        "✏️ Показывает изменённые сообщения\n"
+        "📸 Помогает сохранить одноразовые фото и видео\n"
+        "🎥 Поддерживает кружки, видео, фото, голосовые и файлы\n"
+        "⚙️ Даёт гибкие настройки отслеживания"
+        "</blockquote>\n\n"
+        "❓ <b>Как подключить бота</b>\n\n"
+        "<blockquote>"
+        "1. Нажмите «📄 Скопировать».\n"
+        "2. Нажмите «👌 Подключить».\n"
+        "3. Откройте <b>🤖 Автоматизация чатов</b>.\n"
+        "4. Вставьте скопированный username бота и добавьте его."
+        "</blockquote>\n\n"
+        "⚠️ <i>Если раздел не появляется, обновите Telegram до последней версии.</i>"
     )
 
 
 def send_instruction(chat_id: int):
-    keyboard = {"inline_keyboard": [[{"text": "⚙️ Открыть настройки", "url": "tg://settings/edit"}]]}
+    bot_username = escape_html(BOT_USERNAME)
+    copy_text = f"@{bot_username}" if bot_username else "бот"
+    keyboard = {
+        "inline_keyboard": [
+            [{"text": "📄 Скопировать", "copy_text": {"text": copy_text}}],
+            [{"text": "👌 Подключить", "url": "tg://settings/edit"}],
+        ]
+    }
     image_path = next((path for path in INSTRUCTION_IMAGE_PATHS if os.path.exists(path)), None)
     if image_path:
-        return send_photo(chat_id, image_path, caption=instruction_caption(), keyboard=keyboard)
+        send_photo(chat_id, image_path)
+        return send(chat_id, instruction_caption(), keyboard=keyboard)
     return send(chat_id, instruction_caption(), keyboard=keyboard)
 
 
