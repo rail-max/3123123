@@ -144,9 +144,9 @@ def allow_business_event(owner_id: int, connection_id: str) -> bool:
     return True
 
 
-def mark_business_reply_media_sent(connection_id: str, chat_id: int, message_id: int) -> bool:
+def mark_business_reply_media_sent(chat_id: int, message_id: int, media_file_id: str) -> bool:
     now = int(time.time())
-    key = (connection_id, chat_id, message_id)
+    key = (chat_id, message_id, media_file_id)
     if key in _BUSINESS_REPLY_MEDIA_SENT:
         return False
     _BUSINESS_REPLY_MEDIA_SENT[key] = now
@@ -572,7 +572,10 @@ def send_downloaded_file(chat_id, file_id, file_type, caption=""):
     if not temp_path:
         return {"ok": False}
     try:
-        return send_local_file(chat_id, temp_path, file_type, caption)
+        result = send_local_file(chat_id, temp_path, file_type, caption)
+        if not result.get("ok") and file_type == "photo":
+            return send_local_file(chat_id, temp_path, "document", caption)
+        return result
     finally:
         try:
             os.unlink(temp_path)
@@ -633,7 +636,7 @@ def send_reply_media(chat_id, reply_to_message: dict, caption=""):
     media_type, media_file_id = get_support_media(reply_to_message or {})
     if not media_type or not media_file_id:
         return {"ok": False, "description": "reply has no supported media"}
-    return send_downloaded_file(chat_id, media_file_id, media_type, caption)
+    return send_file(chat_id, media_file_id, media_type, caption, fallback_to_upload=True)
 
 
 def get_business_reply_recipient(msg: dict, fallback_owner_id: int):
@@ -1774,15 +1777,23 @@ def handle_update(update: dict):
         reply_to_message = msg.get("reply_to_message")
         if reply_to_message:
             replied_message_id = reply_to_message.get("message_id")
-            if replied_message_id and mark_business_reply_media_sent(conn_id, msg["chat"]["id"], replied_message_id):
-                recipient_id = get_business_reply_recipient(msg, owner_id)
+            media_type, media_file_id = get_support_media(reply_to_message)
+            recipient_id = get_business_reply_recipient(msg, owner_id)
+            if media_type and media_file_id and not db.is_sub_active(recipient_id):
+                send_expired_message(recipient_id, "deleted", get_chat_link(msg["chat"]))
+                return
+            if (
+                replied_message_id
+                and media_file_id
+                and mark_business_reply_media_sent(msg["chat"]["id"], replied_message_id, media_file_id)
+            ):
                 result = send_reply_media(
                     recipient_id,
                     reply_to_message,
                     f"↩️ <b>Медиа из ответа в чате</b>\n👤 {get_chat_link(msg['chat'])}",
                 )
                 if not result.get("ok"):
-                    _BUSINESS_REPLY_MEDIA_SENT.pop((conn_id, msg["chat"]["id"], replied_message_id), None)
+                    _BUSINESS_REPLY_MEDIA_SENT.pop((msg["chat"]["id"], replied_message_id, media_file_id), None)
                     logging.warning(
                         "Failed to send business reply media recipient_id=%s owner_id=%s connection_id=%s chat_id=%s message_id=%s",
                         recipient_id,

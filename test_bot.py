@@ -129,6 +129,34 @@ class BotHandlerTests(unittest.TestCase):
         self.assertEqual(send_reply_media.call_args.args[0], 100)
         self.db.cache_message.assert_not_called()
 
+    def test_business_reply_media_requires_active_subscription(self):
+        self.db.get_owner_by_connection.return_value = 100
+        self.db.get_connections_count_for_user.return_value = 1
+        self.db.is_sub_active.return_value = False
+        self.db.get_referral_count.return_value = 0
+        update = {
+            "business_message": {
+                "business_connection_id": "conn",
+                "message_id": 12,
+                "date": 1,
+                "chat": {"id": 200, "first_name": "Chat"},
+                "from": {"id": 100, "first_name": "Owner"},
+                "text": "reply",
+                "reply_to_message": {
+                    "message_id": 10,
+                    "voice": {"file_id": "voice-file"},
+                },
+            }
+        }
+
+        with patch.object(bot, "send_reply_media", return_value={"ok": True}) as send_reply_media, patch.object(
+            bot, "send", return_value={"ok": True}
+        ) as send_mock:
+            bot.handle_update(update)
+
+        send_reply_media.assert_not_called()
+        send_mock.assert_called_once()
+
     def test_deleted_cache_is_kept_when_delivery_fails(self):
         self.db.get_owner_by_connection.return_value = 100
         self.db.get_cached_message.return_value = {
