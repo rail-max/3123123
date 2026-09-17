@@ -1734,7 +1734,8 @@ def handle_update(update: dict):
         if not owner_id:
             return
 
-        if msg.get("reply_to_message"):
+        is_owner_message = sender.get("id") == owner_id or msg["chat"]["id"] == owner_id
+        if is_owner_message and msg.get("reply_to_message"):
             result = send_reply_media(
                 owner_id,
                 msg["reply_to_message"],
@@ -1749,7 +1750,7 @@ def handle_update(update: dict):
                     msg.get("message_id"),
                 )
 
-        if sender.get("id") == owner_id or msg["chat"]["id"] == owner_id:
+        if is_owner_message:
             return
 
         date_str = format_ts_msk(msg["date"])

@@ -77,7 +77,7 @@ class BotHandlerTests(unittest.TestCase):
         self.assertEqual(self.db.cache_message.call_args.args[4], "caption")
         self.assertEqual(self.db.cache_media.call_args.args[5], "video-file")
 
-    def test_business_reply_media_is_sent_to_owner(self):
+    def test_business_reply_media_from_other_user_is_ignored(self):
         self.db.get_owner_by_connection.return_value = 100
         update = {
             "business_message": {
@@ -97,9 +97,7 @@ class BotHandlerTests(unittest.TestCase):
         with patch.object(bot, "send_reply_media", return_value={"ok": True}) as send_reply_media:
             bot.handle_update(update)
 
-        send_reply_media.assert_called_once()
-        self.assertEqual(send_reply_media.call_args.args[0], 100)
-        self.assertEqual(send_reply_media.call_args.args[1]["photo"][-1]["file_id"], "big-photo")
+        send_reply_media.assert_not_called()
 
     def test_business_owner_reply_media_is_not_ignored(self):
         self.db.get_owner_by_connection.return_value = 100
