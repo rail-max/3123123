@@ -69,8 +69,10 @@ MENU_ACTION_TEXTS = {
     "Настройки",
     "📖 Инструкция",
     "🔒 Приватность",
+    "💳 Подписка",
     "💳 Купить подписку",
     "📄 Документы",
+    "👥 Рефералка",
     "👥 Пригласить друга",
     "💬 Поддержка",
     "◀️ Назад",
@@ -1065,12 +1067,13 @@ def send_expired_message(
 def main_keyboard():
     return {
         "keyboard": [
-            [{"text": "📊 Статус"}, {"text": "⚙️ Настройки"}],
-            [{"text": "📖 Инструкция"}, {"text": "🔒 Приватность"}],
-            [{"text": "💳 Купить подписку"}, {"text": "👥 Пригласить друга"}],
+            [{"text": "📊 Статус"}, {"text": "⚙️ Настройки"}, {"text": "💳 Подписка"}],
+            [{"text": "📖 Инструкция"}, {"text": "🔒 Приватность"}, {"text": "👥 Рефералка"}],
             [{"text": "📄 Документы"}, {"text": "💬 Поддержка"}],
         ],
-        "resize_keyboard": True
+        "resize_keyboard": True,
+        "is_persistent": True,
+        "input_field_placeholder": "Выберите действие",
     }
 
 
@@ -1084,7 +1087,9 @@ def settings_keyboard(user_id: int):
             [{"text": f"{edit_icon} Изменённые сообщения"}],
             [{"text": "◀️ Назад"}],
         ],
-        "resize_keyboard": True
+        "resize_keyboard": True,
+        "is_persistent": True,
+        "input_field_placeholder": "Настройки отслеживания",
     }
 
 
@@ -1523,7 +1528,7 @@ def handle_update(update: dict):
         elif text == "◀️ Назад":
             send(chat_id, "Главное меню:", keyboard=main_keyboard())
 
-        elif text in ("💳 Купить подписку",):
+        elif text in ("💳 Подписка", "💳 Купить подписку"):
             send(chat_id,
                 f"💳 <b>Купить подписку</b>\n\n"
                 f"⭐ <b>Telegram Stars:</b>\n"
@@ -1552,7 +1557,7 @@ def handle_update(update: dict):
                     keyboard=main_keyboard(),
                 )
 
-        elif text in ("👥 Пригласить друга",):
+        elif text in ("👥 Рефералка", "👥 Пригласить друга"):
             ref_link = get_ref_link(user_id)
             ref_count = db.get_referral_count(user_id)
             share_url = f"https://t.me/share/url?url={ref_link}&text=Попробуй%20этого%20бота!"
