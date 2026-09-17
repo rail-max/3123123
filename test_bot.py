@@ -27,6 +27,7 @@ class BotHandlerTests(unittest.TestCase):
         self.original_db = bot.db
         bot.db = self.db
         bot._BUSINESS_REPLY_MEDIA_SENT.clear()
+        bot._PENDING_LOCKED_MESSAGES.clear()
 
     def tearDown(self):
         bot.db = self.original_db
@@ -154,7 +155,7 @@ class BotHandlerTests(unittest.TestCase):
         send_reply_media.assert_not_called()
         send_mock.assert_called_once()
         keyboard = send_mock.call_args.kwargs["keyboard"]
-        self.assertEqual(keyboard["inline_keyboard"][0][0]["callback_data"], "show_expired_deleted")
+        self.assertTrue(keyboard["inline_keyboard"][0][0]["callback_data"].startswith("show_locked:"))
 
     def test_show_expired_deleted_callback_displays_payment_options(self):
         self.db.get_referral_count.return_value = 0
@@ -162,7 +163,7 @@ class BotHandlerTests(unittest.TestCase):
             "callback_query": {
                 "id": "callback-1",
                 "from": {"id": 100},
-                "data": "show_expired_deleted",
+                "data": "show_locked:missing",
                 "message": {"chat": {"id": 100}, "message_id": 50},
             }
         }
@@ -173,6 +174,34 @@ class BotHandlerTests(unittest.TestCase):
         edit_call = [call for call in api_mock.call_args_list if call.args and call.args[0] == "editMessageText"][0]
         self.assertIn("Ваша подписка закончилась", edit_call.kwargs["text"])
         self.assertEqual(edit_call.kwargs["reply_markup"]["inline_keyboard"][0][0]["callback_data"], "buy_weekly")
+
+    def test_show_locked_callback_sends_saved_media_after_subscription_is_active(self):
+        self.db.is_sub_active.return_value = True
+        token = bot.create_pending_locked_message(
+            100,
+            "deleted",
+            "чатом",
+            {"message_id": 10, "voice": {"file_id": "voice-file"}},
+        )
+        update = {
+            "callback_query": {
+                "id": "callback-1",
+                "from": {"id": 100},
+                "data": f"show_locked:{token}",
+                "message": {"chat": {"id": 100}, "message_id": 50},
+            }
+        }
+
+        with patch.object(bot, "api", return_value={"ok": True}) as api_mock, patch.object(
+            bot, "send_reply_media", return_value={"ok": True}
+        ) as send_reply_media:
+            bot.handle_update(update)
+
+        send_reply_media.assert_called_once()
+        self.assertEqual(send_reply_media.call_args.args[0], 100)
+        self.assertNotIn(token, bot._PENDING_LOCKED_MESSAGES)
+        edit_call = [call for call in api_mock.call_args_list if call.args and call.args[0] == "editMessageText"][0]
+        self.assertIn("Сообщение отправлено", edit_call.kwargs["text"])
 
     def test_incoming_business_reply_does_not_send_expired_notice(self):
         self.db.get_owner_by_connection.return_value = 100

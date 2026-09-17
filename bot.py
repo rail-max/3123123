@@ -88,6 +88,7 @@ MSK = ZoneInfo("Europe/Moscow")
 BUSINESS_RATE_LIMIT_PER_MINUTE = int(os.getenv("BUSINESS_RATE_LIMIT_PER_MINUTE", "120"))
 _BUSINESS_RATE_BUCKETS = {}
 _BUSINESS_REPLY_MEDIA_SENT = {}
+_PENDING_LOCKED_MESSAGES = {}
 TELEGRAM_FILE_DOWNLOAD_TIMEOUT = int(os.getenv("TELEGRAM_FILE_DOWNLOAD_TIMEOUT", "180"))
 TELEGRAM_FILE_UPLOAD_TIMEOUT = int(os.getenv("TELEGRAM_FILE_UPLOAD_TIMEOUT", "180"))
 TELEGRAM_MESSAGE_LIMIT = 4096
@@ -156,6 +157,27 @@ def mark_business_reply_media_sent(chat_id: int, message_id: int, media_file_id:
         for sent_key in stale_keys:
             _BUSINESS_REPLY_MEDIA_SENT.pop(sent_key, None)
     return True
+
+
+def create_pending_locked_message(user_id: int, event_type: str, chat_link: str, reply_to_message: dict | None = None) -> str:
+    token = uuid.uuid4().hex
+    _PENDING_LOCKED_MESSAGES[token] = {
+        "user_id": user_id,
+        "event_type": event_type,
+        "chat_link": chat_link,
+        "reply_to_message": reply_to_message,
+        "created_at": int(time.time()),
+    }
+    if len(_PENDING_LOCKED_MESSAGES) > 5000:
+        cutoff = int(time.time()) - 24 * 60 * 60
+        stale_tokens = [
+            pending_token
+            for pending_token, pending in _PENDING_LOCKED_MESSAGES.items()
+            if pending.get("created_at", 0) < cutoff
+        ]
+        for pending_token in stale_tokens:
+            _PENDING_LOCKED_MESSAGES.pop(pending_token, None)
+    return token
 
 
 def format_ts_msk(unix_ts: int) -> str:
@@ -947,13 +969,20 @@ def expired_payment_keyboard(user_id: int):
     }
 
 
-def send_expired_message(user_id: int, event_type: str, chat_link: str, locked: bool = False):
+def send_expired_message(
+    user_id: int,
+    event_type: str,
+    chat_link: str,
+    locked: bool = False,
+    reply_to_message: dict | None = None,
+):
     if locked and event_type == "deleted":
+        token = create_pending_locked_message(user_id, event_type, chat_link, reply_to_message)
         return send(
             user_id,
             f"🗑️ <b>В чате с {chat_link} удалено сообщение</b>\n\n"
             "Чтобы видеть содержимое удалённых сообщений, продлите подписку.",
-            keyboard={"inline_keyboard": [[{"text": "Показать сообщение", "callback_data": "show_expired_deleted"}]]},
+            keyboard={"inline_keyboard": [[{"text": "Показать сообщение", "callback_data": f"show_locked:{token}"}]]},
         )
 
     if event_type == "edited":
@@ -1157,7 +1186,7 @@ def handle_update(update: dict):
 
         if user_id != ADMIN_ID and msg.get("reply_to_message"):
             if not db.is_sub_active(user_id):
-                send_expired_message(user_id, "deleted", "ботом", locked=True)
+                send_expired_message(user_id, "deleted", "ботом", locked=True, reply_to_message=msg["reply_to_message"])
                 return
             result = send_reply_media(chat_id, msg["reply_to_message"])
             if result.get("ok"):
@@ -1270,10 +1299,10 @@ def handle_update(update: dict):
                 send(chat_id, "❌ Не удалось сделать возврат. Проверь charge_id и логи.")
             return
 
-        if text.startswith("/cancelsub ") and user_id == ADMIN_ID:
+        if (text.startswith("/cancelsub ") or text.startswith("/unsub ")) and user_id == ADMIN_ID:
             parts = text.split(maxsplit=1)
             if len(parts) < 2:
-                send(chat_id, "❌ Формат: /cancelsub user_id или /cancelsub @username")
+                send(chat_id, "❌ Формат: /unsub user_id или /unsub @username")
                 return
             target_id = resolve_user_identifier(parts[1])
             if not target_id:
@@ -1523,7 +1552,8 @@ def handle_update(update: dict):
                 f"/reply user_id текст — ответить в поддержку вручную\n"
                 f"reply на сообщение пользователя — быстрый ответ в поддержку\n"
                 f"/refund user_id|@user telegram_payment_charge_id — вернуть Stars\n"
-                f"/cancelsub user_id|@user — отключить подписку без возврата\n"
+                f"/unsub user_id|@user — отключить подписку без возврата\n"
+                f"/cancelsub user_id|@user — то же самое\n"
                 f"/closesupport user_id|@user — закрыть диалог поддержки\n"
                 f"/supportlist — активные диалоги поддержки\n"
                 f"/payments user_id|@user — последние платежи пользователя\n"
@@ -1706,14 +1736,57 @@ def handle_update(update: dict):
                 parse_mode="HTML",
                 reply_markup=keyboard,
             )
-        elif data == "show_expired_deleted":
+        elif data.startswith("show_locked:"):
+            token = data.split(":", 1)[1]
+            pending = _PENDING_LOCKED_MESSAGES.get(token)
+            if not pending or pending.get("user_id") != user_id:
+                api(
+                    "editMessageText",
+                    chat_id=cq["message"]["chat"]["id"],
+                    message_id=cq["message"]["message_id"],
+                    text=expired_details_text(user_id, "deleted"),
+                    parse_mode="HTML",
+                    reply_markup=expired_payment_keyboard(user_id),
+                )
+                return
+
+            if not db.is_sub_active(user_id):
+                api(
+                    "editMessageText",
+                    chat_id=cq["message"]["chat"]["id"],
+                    message_id=cq["message"]["message_id"],
+                    text=expired_details_text(user_id, pending.get("event_type", "deleted")),
+                    parse_mode="HTML",
+                    reply_markup=expired_payment_keyboard(user_id),
+                )
+                return
+
+            reply_to_message = pending.get("reply_to_message")
+            if reply_to_message:
+                result = send_reply_media(
+                    user_id,
+                    reply_to_message,
+                    f"🗑️ <b>В чате с {pending.get('chat_link', 'чатом')} удалено сообщение</b>",
+                )
+                if result.get("ok"):
+                    _PENDING_LOCKED_MESSAGES.pop(token, None)
+                    api(
+                        "editMessageText",
+                        chat_id=cq["message"]["chat"]["id"],
+                        message_id=cq["message"]["message_id"],
+                        text="✅ Сообщение отправлено выше.",
+                        parse_mode="HTML",
+                    )
+                else:
+                    send(user_id, "❌ Не удалось получить это сообщение. Telegram мог уже закрыть доступ к файлу.")
+                return
+
             api(
                 "editMessageText",
                 chat_id=cq["message"]["chat"]["id"],
                 message_id=cq["message"]["message_id"],
-                text=expired_details_text(user_id, "deleted"),
+                text="❌ Это сообщение уже недоступно. Попробуйте ответить на него ещё раз.",
                 parse_mode="HTML",
-                reply_markup=expired_payment_keyboard(user_id),
             )
         elif data == "buy_platega_monthly":
             payment_url, error_message = create_platega_payment(user_id)
@@ -1802,7 +1875,13 @@ def handle_update(update: dict):
             replied_message_id = reply_to_message.get("message_id")
             media_type, media_file_id = get_support_media(reply_to_message)
             if media_type and media_file_id and not db.is_sub_active(owner_id):
-                send_expired_message(owner_id, "deleted", get_chat_link(msg["chat"]), locked=True)
+                send_expired_message(
+                    owner_id,
+                    "deleted",
+                    get_chat_link(msg["chat"]),
+                    locked=True,
+                    reply_to_message=reply_to_message,
+                )
                 return
             if (
                 replied_message_id
