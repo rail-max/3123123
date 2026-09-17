@@ -461,6 +461,13 @@ def send_start_flow(chat_id: int):
     return send(chat_id, "Главное меню:", keyboard=main_keyboard())
 
 
+def unlock_start_after_channel(user_id: int, chat_id: int):
+    granted = db.grant_channel_trial_once(user_id, 7)
+    if granted:
+        send(chat_id, "✅ <b>Подписка на канал найдена!</b>\nВам выдано <b>7 дней доступа</b>.")
+    return send_start_flow(chat_id)
+
+
 def send(chat_id, text, keyboard=None):
     params = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
     if keyboard:
@@ -1197,6 +1204,10 @@ def handle_update(update: dict):
         db.save_user(user_id, user.get("username", ""), user.get("first_name", ""))
         s = get_settings(user_id)
 
+        if user_id != ADMIN_ID and not text.startswith("/start") and not is_required_channel_member(user_id):
+            send_subscription_gate(chat_id)
+            return
+
         if text == "/cancel":
             if s.get("support_mode"):
                 s["support_mode"] = False
@@ -1431,7 +1442,7 @@ def handle_update(update: dict):
 
         if text.startswith("/start"):
             if is_required_channel_member(user_id):
-                send_start_flow(chat_id)
+                unlock_start_after_channel(user_id, chat_id)
             else:
                 send_subscription_gate(chat_id)
 
@@ -1774,7 +1785,17 @@ def handle_update(update: dict):
                 text="✅ Подписка найдена. Открываю бота.",
                 parse_mode="HTML",
             )
-            send_start_flow(cq["message"]["chat"]["id"])
+            unlock_start_after_channel(user_id, cq["message"]["chat"]["id"])
+            return
+
+        if user_id != ADMIN_ID and not is_required_channel_member(user_id):
+            api(
+                "answerCallbackQuery",
+                callback_query_id=cq["id"],
+                text="Сначала подпишись на канал.",
+                show_alert=True,
+            )
+            send_subscription_gate(cq["message"]["chat"]["id"])
             return
 
         api("answerCallbackQuery", callback_query_id=cq["id"])

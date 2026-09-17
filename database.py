@@ -103,6 +103,7 @@ def init_db():
             sub_type        TEXT DEFAULT 'trial',
             sub_expires     TIMESTAMP,
             sub_remaining_seconds INTEGER DEFAULT 0,
+            channel_trial_granted BOOLEAN DEFAULT FALSE,
             created_at      TIMESTAMP DEFAULT NOW()
         )
     """)
@@ -235,6 +236,10 @@ def init_db():
         ADD COLUMN IF NOT EXISTS sub_remaining_seconds INTEGER DEFAULT 0
     """)
     c.execute("""
+        ALTER TABLE users
+        ADD COLUMN IF NOT EXISTS channel_trial_granted BOOLEAN DEFAULT FALSE
+    """)
+    c.execute("""
         ALTER TABLE referrals
         ADD COLUMN IF NOT EXISTS rewarded BOOLEAN DEFAULT TRUE
     """)
@@ -331,11 +336,11 @@ def save_user(user_id: int, username: str, first_name: str = ""):
     c = conn.cursor()
     c.execute("""
         INSERT INTO users (user_id, username, first_name, sub_type, sub_expires, sub_remaining_seconds)
-        VALUES (%s, %s, %s, 'trial', NULL, %s)
+        VALUES (%s, %s, %s, 'expired', NULL, 0)
         ON CONFLICT(user_id) DO UPDATE SET
             username = EXCLUDED.username,
             first_name = EXCLUDED.first_name
-    """, (user_id, username or "", first_name or "", 14 * 24 * 60 * 60))
+    """, (user_id, username or "", first_name or ""))
     conn.commit()
     release_conn(conn)
 
@@ -411,6 +416,81 @@ def set_subscription(user_id: int, sub_type: str, days: int):
         """, (sub_type, remaining_seconds, user_id))
     conn.commit()
     release_conn(conn)
+
+
+def grant_channel_trial_once(user_id: int, days: int = 7) -> bool:
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("""
+        SELECT sub_type, sub_expires, sub_remaining_seconds, channel_trial_granted
+        FROM users
+        WHERE user_id = %s
+        FOR UPDATE
+    """, (user_id,))
+    user = c.fetchone()
+    if not user:
+        c.execute("""
+            INSERT INTO users (
+                user_id, sub_type, sub_expires, sub_remaining_seconds, channel_trial_granted
+            )
+            VALUES (%s, 'expired', NULL, 0, FALSE)
+        """, (user_id,))
+        user = {
+            "sub_type": "expired",
+            "sub_expires": None,
+            "sub_remaining_seconds": 0,
+            "channel_trial_granted": False,
+        }
+
+    if isinstance(user, dict):
+        sub_type = user.get("sub_type")
+        expires = user.get("sub_expires")
+        trial_granted = user.get("channel_trial_granted")
+    else:
+        sub_type, expires, _remaining_seconds, trial_granted = user
+
+    if trial_granted or sub_type == "banned":
+        conn.commit()
+        release_conn(conn)
+        return False
+
+    c.execute("SELECT COUNT(*) FROM connections WHERE owner_id = %s AND is_enabled = 1", (user_id,))
+    active_connections = c.fetchone()[0]
+    remaining_seconds = max(0, int(days * 24 * 60 * 60))
+    has_active_subscription = False
+    if active_connections and expires:
+        if isinstance(expires, str):
+            expires = datetime.strptime(expires[:19], "%Y-%m-%d %H:%M:%S")
+        has_active_subscription = now_msk() < expires
+
+    if has_active_subscription:
+        c.execute("""
+            UPDATE users
+            SET channel_trial_granted = TRUE
+            WHERE user_id = %s
+        """, (user_id,))
+    elif active_connections:
+        c.execute("""
+            UPDATE users
+            SET sub_type = 'trial',
+                sub_expires = %s,
+                sub_remaining_seconds = 0,
+                channel_trial_granted = TRUE
+            WHERE user_id = %s
+        """, (now_msk() + timedelta(days=days), user_id))
+    else:
+        c.execute("""
+            UPDATE users
+            SET sub_type = 'trial',
+                sub_expires = NULL,
+                sub_remaining_seconds = GREATEST(COALESCE(sub_remaining_seconds, 0), %s),
+                channel_trial_granted = TRUE
+            WHERE user_id = %s
+        """, (remaining_seconds, user_id))
+
+    conn.commit()
+    release_conn(conn)
+    return not has_active_subscription
 
 
 def add_days(user_id: int, days: int):
