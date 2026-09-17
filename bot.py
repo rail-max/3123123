@@ -9,6 +9,7 @@ import time
 import logging
 import sys
 import os
+import shutil
 import tempfile
 import threading
 import hmac
@@ -86,6 +87,9 @@ BOT_USERNAME = ""
 MSK = ZoneInfo("Europe/Moscow")
 BUSINESS_RATE_LIMIT_PER_MINUTE = int(os.getenv("BUSINESS_RATE_LIMIT_PER_MINUTE", "120"))
 _BUSINESS_RATE_BUCKETS = {}
+_BUSINESS_REPLY_MEDIA_SENT = {}
+TELEGRAM_FILE_DOWNLOAD_TIMEOUT = int(os.getenv("TELEGRAM_FILE_DOWNLOAD_TIMEOUT", "180"))
+TELEGRAM_FILE_UPLOAD_TIMEOUT = int(os.getenv("TELEGRAM_FILE_UPLOAD_TIMEOUT", "180"))
 TELEGRAM_MESSAGE_LIMIT = 4096
 TELEGRAM_CAPTION_LIMIT = 1024
 TELEGRAM_USERNAME_RE = re.compile(r"^[A-Za-z0-9_]{5,32}$")
@@ -137,6 +141,20 @@ def allow_business_event(owner_id: int, connection_id: str) -> bool:
         stale_windows = {bucket_key for bucket_key in _BUSINESS_RATE_BUCKETS if bucket_key[2] < window - 2}
         for bucket_key in stale_windows:
             _BUSINESS_RATE_BUCKETS.pop(bucket_key, None)
+    return True
+
+
+def mark_business_reply_media_sent(connection_id: str, chat_id: int, message_id: int) -> bool:
+    now = int(time.time())
+    key = (connection_id, chat_id, message_id)
+    if key in _BUSINESS_REPLY_MEDIA_SENT:
+        return False
+    _BUSINESS_REPLY_MEDIA_SENT[key] = now
+    if len(_BUSINESS_REPLY_MEDIA_SENT) > 5000:
+        cutoff = now - 24 * 60 * 60
+        stale_keys = [sent_key for sent_key, sent_at in _BUSINESS_REPLY_MEDIA_SENT.items() if sent_at < cutoff]
+        for sent_key in stale_keys:
+            _BUSINESS_REPLY_MEDIA_SENT.pop(sent_key, None)
     return True
 
 
@@ -506,7 +524,7 @@ def send_local_file(chat_id, file_path, file_type, caption=""):
         headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
     )
     try:
-        with urllib.request.urlopen(req, timeout=60) as r:
+        with urllib.request.urlopen(req, timeout=TELEGRAM_FILE_UPLOAD_TIMEOUT) as r:
             response = json.loads(r.read().decode("utf-8"))
             if not response.get("ok"):
                 logging.error("Telegram API returned error for %s upload: %s", method, response)
@@ -536,7 +554,9 @@ def download_telegram_file(file_id, file_type):
 
     file_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{urllib.parse.quote(file_path, safe='/')}"
     try:
-        urllib.request.urlretrieve(file_url, temp_path)
+        with urllib.request.urlopen(file_url, timeout=TELEGRAM_FILE_DOWNLOAD_TIMEOUT) as response:
+            with open(temp_path, "wb") as output:
+                shutil.copyfileobj(response, output)
         return temp_path
     except Exception as exc:
         logging.error("Telegram file download failed for file_type=%s path=%s: %s", file_type, file_path, exc)
@@ -614,6 +634,23 @@ def send_reply_media(chat_id, reply_to_message: dict, caption=""):
     if not media_type or not media_file_id:
         return {"ok": False, "description": "reply has no supported media"}
     return send_downloaded_file(chat_id, media_file_id, media_type, caption)
+
+
+def get_business_reply_recipient(msg: dict, fallback_owner_id: int):
+    candidates = []
+    sender_id = (msg.get("from") or {}).get("id")
+    chat_id = (msg.get("chat") or {}).get("id")
+    for candidate in (sender_id, chat_id, fallback_owner_id):
+        if candidate and candidate not in candidates:
+            candidates.append(candidate)
+
+    for candidate in candidates:
+        try:
+            if db.get_connections_count_for_user(candidate) > 0:
+                return candidate
+        except Exception as exc:
+            logging.warning("Failed to check active connections for user_id=%s: %s", candidate, exc)
+    return fallback_owner_id
 
 
 def save_support_link_from_result(result: dict, user_id: int):
@@ -1734,23 +1771,34 @@ def handle_update(update: dict):
         if not owner_id:
             return
 
-        is_owner_message = sender.get("id") == owner_id or msg["chat"]["id"] == owner_id
-        if is_owner_message and msg.get("reply_to_message"):
-            result = send_reply_media(
-                owner_id,
-                msg["reply_to_message"],
-                f"↩️ <b>Медиа из ответа в чате</b>\n👤 {get_chat_link(msg['chat'])}",
-            )
-            if not result.get("ok"):
-                logging.warning(
-                    "Failed to send business reply media owner_id=%s connection_id=%s chat_id=%s message_id=%s",
-                    owner_id,
-                    conn_id,
-                    msg["chat"]["id"],
-                    msg.get("message_id"),
+        reply_to_message = msg.get("reply_to_message")
+        if reply_to_message:
+            replied_message_id = reply_to_message.get("message_id")
+            if replied_message_id and mark_business_reply_media_sent(conn_id, msg["chat"]["id"], replied_message_id):
+                recipient_id = get_business_reply_recipient(msg, owner_id)
+                result = send_reply_media(
+                    recipient_id,
+                    reply_to_message,
+                    f"↩️ <b>Медиа из ответа в чате</b>\n👤 {get_chat_link(msg['chat'])}",
                 )
+                if not result.get("ok"):
+                    _BUSINESS_REPLY_MEDIA_SENT.pop((conn_id, msg["chat"]["id"], replied_message_id), None)
+                    logging.warning(
+                        "Failed to send business reply media recipient_id=%s owner_id=%s connection_id=%s chat_id=%s message_id=%s",
+                        recipient_id,
+                        owner_id,
+                        conn_id,
+                        msg["chat"]["id"],
+                        msg.get("message_id"),
+                    )
+                    send(
+                        recipient_id,
+                        "❌ Не удалось переслать медиа из ответа. "
+                        "Файл мог быть слишком большим, одноразовое медиа могло стать недоступным, "
+                        "или Telegram не успел отдать файл.",
+                    )
 
-        if is_owner_message:
+        if sender.get("id") == owner_id or msg["chat"]["id"] == owner_id:
             return
 
         date_str = format_ts_msk(msg["date"])
