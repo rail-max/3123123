@@ -58,6 +58,42 @@ class BotHandlerTests(unittest.TestCase):
         self.db.cache_message.assert_not_called()
         self.db.cache_media.assert_not_called()
 
+    def test_start_requires_channel_subscription(self):
+        update = {
+            "message": {
+                "chat": {"id": 100},
+                "from": {"id": 100, "username": "user1", "first_name": "User"},
+                "text": "/start",
+            }
+        }
+
+        with patch.object(bot, "is_required_channel_member", return_value=False), patch.object(
+            bot, "send_subscription_gate", return_value={"ok": True}
+        ) as gate_mock, patch.object(bot, "send_start_flow", return_value={"ok": True}) as start_mock:
+            bot.handle_update(update)
+
+        gate_mock.assert_called_once_with(100)
+        start_mock.assert_not_called()
+
+    def test_check_required_channel_starts_bot_when_subscribed(self):
+        update = {
+            "callback_query": {
+                "id": "callback-1",
+                "from": {"id": 100},
+                "data": "check_required_channel",
+                "message": {"chat": {"id": 100}, "message_id": 50},
+            }
+        }
+
+        with patch.object(bot, "is_required_channel_member", return_value=True), patch.object(
+            bot, "api", return_value={"ok": True}
+        ) as api_mock, patch.object(bot, "send_start_flow", return_value={"ok": True}) as start_mock:
+            bot.handle_update(update)
+
+        start_mock.assert_called_once_with(100)
+        edit_call = [call for call in api_mock.call_args_list if call.args and call.args[0] == "editMessageText"][0]
+        self.assertIn("Подписка найдена", edit_call.kwargs["text"])
+
     def test_media_caption_and_file_are_both_cached(self):
         self.db.get_owner_by_connection.return_value = 100
         update = {

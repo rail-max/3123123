@@ -88,6 +88,8 @@ ALLOWED_UPDATES = [
 
 BOT_USERNAME = ""
 MSK = ZoneInfo("Europe/Moscow")
+REQUIRED_CHANNEL_USERNAME = "@DialogDelBotMax"
+REQUIRED_CHANNEL_URL = "https://t.me/DialogDelBotMax"
 BUSINESS_RATE_LIMIT_PER_MINUTE = int(os.getenv("BUSINESS_RATE_LIMIT_PER_MINUTE", "120"))
 _BUSINESS_RATE_BUCKETS = {}
 _BUSINESS_REPLY_MEDIA_SENT = {}
@@ -418,6 +420,45 @@ def api(method, **params):
     except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError) as exc:
         logging.error("Telegram API transport error for %s: %s", method, exc)
         return {"ok": False, "description": str(exc)}
+
+
+def is_required_channel_member(user_id: int) -> bool:
+    result = api("getChatMember", chat_id=REQUIRED_CHANNEL_USERNAME, user_id=user_id)
+    if not result.get("ok"):
+        logging.warning("Required channel membership check failed for user_id=%s: %s", user_id, result)
+        return False
+
+    member = result.get("result", {})
+    status = member.get("status")
+    if status in ("creator", "administrator", "member"):
+        return True
+    if status == "restricted" and member.get("is_member"):
+        return True
+    return False
+
+
+def subscription_gate_keyboard():
+    return {
+        "inline_keyboard": [
+            [{"text": "Подписаться на канал", "url": REQUIRED_CHANNEL_URL}],
+            [{"text": "✅ Проверить подписку", "callback_data": "check_required_channel"}],
+        ]
+    }
+
+
+def send_subscription_gate(chat_id: int):
+    return send(
+        chat_id,
+        "🔒 <b>Перед запуском подпишись на канал</b>\n\n"
+        f"Канал: {REQUIRED_CHANNEL_USERNAME}\n\n"
+        "После подписки нажми «Проверить подписку».",
+        keyboard=subscription_gate_keyboard(),
+    )
+
+
+def send_start_flow(chat_id: int):
+    send_instruction(chat_id)
+    return send(chat_id, "Главное меню:", keyboard=main_keyboard())
 
 
 def send(chat_id, text, keyboard=None):
@@ -1389,8 +1430,10 @@ def handle_update(update: dict):
                     db.add_referral(referrer_id, user_id)
 
         if text.startswith("/start"):
-            send_instruction(chat_id)
-            send(chat_id, "Главное меню:", keyboard=main_keyboard())
+            if is_required_channel_member(user_id):
+                send_start_flow(chat_id)
+            else:
+                send_subscription_gate(chat_id)
 
         elif text in ("📊 Статус", "Статус"):
             is_connected = db.get_connections_count_for_user(user_id) or db.get_connections_count_for_user(chat_id)
@@ -1714,6 +1757,26 @@ def handle_update(update: dict):
         cq = update["callback_query"]
         user_id = cq["from"]["id"]
         data = cq.get("data", "")
+        if data == "check_required_channel":
+            if not is_required_channel_member(user_id):
+                api(
+                    "answerCallbackQuery",
+                    callback_query_id=cq["id"],
+                    text="Сначала подпишись на канал, потом нажми проверку ещё раз.",
+                    show_alert=True,
+                )
+                return
+            api("answerCallbackQuery", callback_query_id=cq["id"])
+            api(
+                "editMessageText",
+                chat_id=cq["message"]["chat"]["id"],
+                message_id=cq["message"]["message_id"],
+                text="✅ Подписка найдена. Открываю бота.",
+                parse_mode="HTML",
+            )
+            send_start_flow(cq["message"]["chat"]["id"])
+            return
+
         api("answerCallbackQuery", callback_query_id=cq["id"])
 
         if data.startswith("users:ref:") and user_id == ADMIN_ID:
