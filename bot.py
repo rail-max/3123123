@@ -724,11 +724,20 @@ def get_support_media(msg: dict):
     return None, None
 
 
-def send_reply_media(chat_id, reply_to_message: dict, caption=""):
+def send_reply_media(chat_id, reply_to_message: dict, caption="", prefer_upload: bool = False):
     media_type, media_file_id = get_support_media(reply_to_message or {})
     if not media_type or not media_file_id:
         return {"ok": False, "description": "reply has no supported media"}
+    if prefer_upload:
+        return send_downloaded_file(chat_id, media_file_id, media_type, caption)
     return send_file(chat_id, media_file_id, media_type, caption, fallback_to_upload=True)
+
+
+def message_sender_id(message: dict | None):
+    if not message:
+        return None
+    sender = message.get("from") or {}
+    return sender.get("id")
 
 
 def is_reply_media_save_candidate(reply_to_message: dict | None) -> bool:
@@ -1321,11 +1330,15 @@ def handle_update(update: dict):
                 send(chat_id, f"✅ Ответ отправлен пользователю {target_id}.")
                 return
 
-        if user_id != ADMIN_ID and is_reply_media_save_candidate(msg.get("reply_to_message")):
+        if (
+            user_id != ADMIN_ID
+            and is_reply_media_save_candidate(msg.get("reply_to_message"))
+            and message_sender_id(msg.get("reply_to_message")) != user_id
+        ):
             if not db.is_sub_active(user_id):
                 send_expired_message(user_id, "reply_media", "ботом", locked=True, reply_to_message=msg["reply_to_message"])
                 return
-            result = send_reply_media(chat_id, msg["reply_to_message"])
+            result = send_reply_media(chat_id, msg["reply_to_message"], prefer_upload=True)
             if result.get("ok"):
                 return
 
@@ -1939,6 +1952,7 @@ def handle_update(update: dict):
                     user_id,
                     reply_to_message,
                     caption,
+                    prefer_upload=event_type == "reply_media",
                 )
                 if result.get("ok"):
                     _PENDING_LOCKED_MESSAGES.pop(token, None)
@@ -2038,7 +2052,11 @@ def handle_update(update: dict):
 
         reply_to_message = msg.get("reply_to_message")
         is_owner_message = sender.get("id") == owner_id
-        if is_owner_message and is_reply_media_save_candidate(reply_to_message):
+        if (
+            is_owner_message
+            and is_reply_media_save_candidate(reply_to_message)
+            and message_sender_id(reply_to_message) != owner_id
+        ):
             replied_message_id = reply_to_message.get("message_id")
             media_type, media_file_id = get_support_media(reply_to_message)
             if not db.is_sub_active(owner_id):
@@ -2059,6 +2077,7 @@ def handle_update(update: dict):
                     owner_id,
                     reply_to_message,
                     reply_media_notice_caption(get_chat_link(msg["chat"]), reply_to_message.get("date", msg["date"])),
+                    prefer_upload=True,
                 )
                 if not result.get("ok"):
                     _BUSINESS_REPLY_MEDIA_SENT.pop((msg["chat"]["id"], replied_message_id, media_file_id), None)
