@@ -464,10 +464,19 @@ def send_start_flow(chat_id: int):
 
 
 def unlock_start_after_channel(user_id: int, chat_id: int):
-    granted = db.grant_channel_trial_once(user_id, 7)
-    if granted:
-        send(chat_id, "✅ <b>Подписка на канал найдена!</b>\nВам выдано <b>7 дней доступа</b>.")
+    ensure_channel_trial(user_id, chat_id, notify=True)
     return send_start_flow(chat_id)
+
+
+def ensure_channel_trial(user_id: int, chat_id: int | None = None, notify: bool = False) -> bool:
+    try:
+        granted = db.grant_channel_trial_once(user_id, 7)
+    except Exception as exc:
+        logging.error("Failed to grant channel trial user_id=%s: %s", user_id, exc)
+        return False
+    if granted and notify and chat_id:
+        send(chat_id, "✅ <b>Подписка на канал найдена!</b>\nВам выдано <b>7 дней доступа</b>.")
+    return granted
 
 
 def send(chat_id, text, keyboard=None):
@@ -615,9 +624,11 @@ def send_local_file(chat_id, file_path, file_type, caption=""):
         data=bytes(body),
         headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
     )
+    started_at = time.monotonic()
     try:
         with urllib.request.urlopen(req, timeout=TELEGRAM_FILE_UPLOAD_TIMEOUT) as r:
             response = json.loads(r.read().decode("utf-8"))
+            logging.info("Telegram media upload file_type=%s elapsed=%.2fs ok=%s", file_type, time.monotonic() - started_at, response.get("ok"))
             if not response.get("ok"):
                 logging.error("Telegram API returned error for %s upload: %s", method, response)
             elif caption and file_type in MEDIA_WITHOUT_CAPTION:
@@ -629,6 +640,7 @@ def send_local_file(chat_id, file_path, file_type, caption=""):
 
 
 def download_telegram_file(file_id, file_type):
+    started_at = time.monotonic()
     response = api("getFile", file_id=file_id)
     if not response.get("ok"):
         logging.error("getFile failed for file_type=%s", file_type)
@@ -649,6 +661,7 @@ def download_telegram_file(file_id, file_type):
         with urllib.request.urlopen(file_url, timeout=TELEGRAM_FILE_DOWNLOAD_TIMEOUT) as response:
             with open(temp_path, "wb") as output:
                 shutil.copyfileobj(response, output)
+        logging.info("Telegram media download file_type=%s elapsed=%.2fs", file_type, time.monotonic() - started_at)
         return temp_path
     except Exception as exc:
         logging.error("Telegram file download failed for file_type=%s path=%s: %s", file_type, file_path, exc)
@@ -728,6 +741,19 @@ def send_reply_media(chat_id, reply_to_message: dict, caption="", prefer_upload:
     media_type, media_file_id = get_support_media(reply_to_message or {})
     if not media_type or not media_file_id:
         return {"ok": False, "description": "reply has no supported media"}
+    # Telegram can resend a photo by file_id without downloading and uploading it.
+    if media_type == "photo":
+        started_at = time.monotonic()
+        result = send_file(chat_id, media_file_id, media_type, caption)
+        logging.info(
+            "Reply photo file_id send elapsed=%.2fs ok=%s error_code=%s",
+            time.monotonic() - started_at,
+            result.get("ok"),
+            result.get("error_code"),
+        )
+        if result.get("error_code") == 400:
+            return send_downloaded_file(chat_id, media_file_id, media_type, caption)
+        return result
     if prefer_upload:
         return send_downloaded_file(chat_id, media_file_id, media_type, caption)
     return send_file(chat_id, media_file_id, media_type, caption, fallback_to_upload=True)
@@ -1284,9 +1310,11 @@ def handle_update(update: dict):
         db.save_user(user_id, user.get("username", ""), user.get("first_name", ""))
         s = get_settings(user_id)
 
-        if user_id != ADMIN_ID and not text.startswith("/start") and not is_required_channel_member(user_id):
-            send_subscription_gate(chat_id)
-            return
+        if user_id != ADMIN_ID and not text.startswith("/start"):
+            if not is_required_channel_member(user_id):
+                send_subscription_gate(chat_id)
+                return
+            ensure_channel_trial(user_id, chat_id, notify=True)
 
         if text == "/cancel":
             if s.get("support_mode"):
@@ -1881,6 +1909,8 @@ def handle_update(update: dict):
             )
             send_subscription_gate(cq["message"]["chat"]["id"])
             return
+        if user_id != ADMIN_ID:
+            ensure_channel_trial(user_id, cq["message"]["chat"]["id"], notify=True)
 
         api("answerCallbackQuery", callback_query_id=cq["id"])
 

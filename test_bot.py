@@ -24,6 +24,7 @@ class BotHandlerTests(unittest.TestCase):
             "support_active": False,
         }
         self.db.is_sub_active.return_value = True
+        self.db.grant_channel_trial_once.return_value = False
         self.original_db = bot.db
         bot.db = self.db
         bot._BUSINESS_REPLY_MEDIA_SENT.clear()
@@ -31,6 +32,41 @@ class BotHandlerTests(unittest.TestCase):
 
     def tearDown(self):
         bot.db = self.original_db
+
+    def test_reply_photo_uses_file_id_without_download_when_accepted(self):
+        reply = {"photo": [{"file_id": "small-photo"}, {"file_id": "big-photo"}]}
+
+        with patch.object(bot, "api", return_value={"ok": True}) as api_mock, patch.object(
+            bot, "send_downloaded_file"
+        ) as download_mock:
+            result = bot.send_reply_media(100, reply, "Photo", prefer_upload=True)
+
+        self.assertTrue(result["ok"])
+        api_mock.assert_called_once_with("sendPhoto", chat_id=100, photo="big-photo", caption="Photo", parse_mode="HTML")
+        download_mock.assert_not_called()
+
+    def test_reply_photo_downloads_only_after_file_id_rejection(self):
+        reply = {"photo": [{"file_id": "photo-id"}]}
+
+        with patch.object(bot, "api", return_value={"ok": False, "error_code": 400}) as api_mock, patch.object(
+            bot, "send_downloaded_file", return_value={"ok": True}
+        ) as download_mock:
+            result = bot.send_reply_media(100, reply, prefer_upload=True)
+
+        self.assertTrue(result["ok"])
+        api_mock.assert_called_once()
+        download_mock.assert_called_once_with(100, "photo-id", "photo", "")
+
+    def test_reply_photo_does_not_retry_after_uncertain_transport_failure(self):
+        reply = {"photo": [{"file_id": "photo-id"}]}
+
+        with patch.object(bot, "api", return_value={"ok": False, "description": "timed out"}), patch.object(
+            bot, "send_downloaded_file"
+        ) as download_mock:
+            result = bot.send_reply_media(100, reply, prefer_upload=True)
+
+        self.assertFalse(result["ok"])
+        download_mock.assert_not_called()
 
     def test_escape_html_blocks_telegram_html_injection(self):
         self.assertEqual(bot.escape_html('<a href="x">&'), "&lt;a href=&quot;x&quot;&gt;&amp;")
@@ -91,6 +127,30 @@ class BotHandlerTests(unittest.TestCase):
 
         gate_mock.assert_called_once_with(100)
         self.db.get_connections_count_for_user.assert_not_called()
+
+    def test_menu_action_grants_channel_trial_when_subscribed(self):
+        self.db.grant_channel_trial_once.return_value = True
+        self.db.get_connections_count_for_user.return_value = 1
+        self.db.get_user.return_value = {
+            "sub_type": "trial",
+            "sub_expires": None,
+            "sub_remaining_seconds": 7 * 24 * 60 * 60,
+        }
+        update = {
+            "message": {
+                "chat": {"id": 100},
+                "from": {"id": 100, "username": "user1", "first_name": "User"},
+                "text": "📊 Статус",
+            }
+        }
+
+        with patch.object(bot, "is_required_channel_member", return_value=True), patch.object(
+            bot, "send", return_value={"ok": True}
+        ) as send_mock:
+            bot.handle_update(update)
+
+        self.db.grant_channel_trial_once.assert_called_once_with(100, 7)
+        self.assertIn("7 дней доступа", send_mock.call_args_list[0].args[1])
 
     def test_check_required_channel_starts_bot_when_subscribed(self):
         update = {
