@@ -576,7 +576,7 @@ MEDIA_FILE_SUFFIXES = {
     "sticker": ".webp",
 }
 MEDIA_WITHOUT_CAPTION = {"video_note", "sticker"}
-REPLY_MEDIA_SAVE_TYPES = {"photo", "video"}
+REPLY_MEDIA_SAVE_TYPES = {"photo", "video", "voice", "video_note"}
 
 
 def send_local_file(chat_id, file_path, file_type, caption=""):
@@ -737,12 +737,29 @@ def is_reply_media_save_candidate(reply_to_message: dict | None) -> bool:
     media_type, media_file_id = get_support_media(reply_to_message)
     if media_type not in REPLY_MEDIA_SAVE_TYPES or not media_file_id:
         return False
+    media_payload = reply_to_message.get(media_type) or {}
+    text_hint = " ".join(
+        str(value).lower()
+        for value in (
+            reply_to_message.get("text"),
+            reply_to_message.get("caption"),
+            reply_to_message.get("quote", {}).get("text") if isinstance(reply_to_message.get("quote"), dict) else "",
+        )
+        if value
+    )
     return bool(
         reply_to_message.get("has_protected_content")
         or reply_to_message.get("has_media_spoiler")
         or reply_to_message.get("ttl_seconds")
         or reply_to_message.get("is_view_once")
         or reply_to_message.get("self_destruct_type")
+        or media_payload.get("ttl_seconds")
+        or media_payload.get("is_view_once")
+        or media_payload.get("self_destruct_type")
+        or "однораз" in text_hint
+        or "истек" in text_hint
+        or "expired" in text_hint
+        or "view once" in text_hint
     )
 
 

@@ -220,6 +220,31 @@ class BotHandlerTests(unittest.TestCase):
         send_mock.assert_not_called()
         self.db.cache_message.assert_not_called()
 
+    def test_business_owner_protected_voice_reply_media_is_sent(self):
+        self.db.get_owner_by_connection.return_value = 100
+        update = {
+            "business_message": {
+                "business_connection_id": "conn",
+                "message_id": 12,
+                "date": 1,
+                "chat": {"id": 200, "first_name": "Chat"},
+                "from": {"id": 100, "first_name": "Owner"},
+                "text": "reply",
+                "reply_to_message": {
+                    "message_id": 10,
+                    "has_protected_content": True,
+                    "voice": {"file_id": "voice-file"},
+                },
+            }
+        }
+
+        with patch.object(bot, "send_reply_media", return_value={"ok": True}) as send_reply_media:
+            bot.handle_update(update)
+
+        send_reply_media.assert_called_once()
+        self.assertEqual(send_reply_media.call_args.args[0], 100)
+        self.assertIn("Медиа из ответа", send_reply_media.call_args.args[2])
+
     def test_business_owner_plain_video_note_reply_media_is_ignored(self):
         self.db.get_owner_by_connection.return_value = 100
         update = {
