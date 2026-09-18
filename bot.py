@@ -2074,6 +2074,7 @@ def handle_update(update: dict):
     # ── Новое сообщение из бизнес-чата ────────────────────
     elif "business_message" in update:
         msg = update["business_message"]
+        update_received_at = time.time()
         conn_id = msg.get("business_connection_id", "")
         sender = msg.get("from", {})
         owner_id = get_business_owner(conn_id)
@@ -2087,6 +2088,11 @@ def handle_update(update: dict):
             and is_reply_media_save_candidate(reply_to_message)
             and message_sender_id(reply_to_message) != owner_id
         ):
+            logging.info(
+                "Business reply media update age=%.2fs file_type=%s",
+                max(0.0, update_received_at - msg["date"]),
+                get_support_media(reply_to_message)[0],
+            )
             replied_message_id = reply_to_message.get("message_id")
             media_type, media_file_id = get_support_media(reply_to_message)
             if not db.is_sub_active(owner_id):
