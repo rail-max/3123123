@@ -68,6 +68,78 @@ class BotHandlerTests(unittest.TestCase):
         self.assertFalse(result["ok"])
         download_mock.assert_not_called()
 
+    def test_reply_video_voice_and_circle_use_file_id_first(self):
+        for media_type, method in (
+            ("video", "sendVideo"),
+            ("voice", "sendVoice"),
+            ("video_note", "sendVideoNote"),
+        ):
+            for prefer_upload in (False, True):
+                with self.subTest(media_type=media_type, prefer_upload=prefer_upload):
+                    reply = {media_type: {"file_id": "media-id"}, "is_view_once": True}
+                    with patch.object(bot, "api", return_value={"ok": True}) as api_mock, patch.object(
+                        bot, "send_downloaded_file"
+                    ) as download_mock, patch.object(bot, "send") as notice_mock:
+                        result = bot.send_reply_media(100, reply, "Notice", prefer_upload=prefer_upload)
+
+                    self.assertTrue(result["ok"])
+                    params = {"chat_id": 100, media_type: "media-id"}
+                    if media_type == "video_note":
+                        notice_mock.assert_called_once_with(100, "Notice")
+                    else:
+                        params.update(caption="Notice", parse_mode="HTML")
+                        notice_mock.assert_not_called()
+                    api_mock.assert_called_once_with(method, **params)
+                    download_mock.assert_not_called()
+
+    def test_reply_media_falls_back_once_on_explicit_rejection(self):
+        for media_type in ("video", "voice", "video_note"):
+            with self.subTest(media_type=media_type):
+                reply = {media_type: {"file_id": "media-id"}}
+                with patch.object(bot, "api", return_value={"ok": False, "error_code": 400}) as api_mock, patch.object(
+                    bot, "send_downloaded_file", return_value={"ok": True}
+                ) as download_mock, patch.object(bot, "send") as notice_mock:
+                    result = bot.send_reply_media(100, reply, "Notice", prefer_upload=True)
+
+                self.assertTrue(result["ok"])
+                api_mock.assert_called_once()
+                download_mock.assert_called_once_with(100, "media-id", media_type, "Notice")
+                # The fallback sends its own notice only after the media succeeds.
+                notice_mock.assert_not_called()
+
+    def test_reply_media_does_not_reupload_after_timeout_or_other_api_errors(self):
+        for media_type in ("photo", "video", "voice", "video_note"):
+            for error in (
+                {"ok": False, "description": "timed out"},
+                {"ok": False, "error_code": 403},
+                {"ok": False, "error_code": 429, "parameters": {"retry_after": 5}},
+                {"ok": False, "error_code": 500},
+            ):
+                with self.subTest(media_type=media_type, error=error):
+                    payload = {"file_id": "media-id"}
+                    reply = {media_type: [payload] if media_type == "photo" else payload}
+                    with patch.object(bot, "api", return_value=error) as api_mock, patch.object(
+                        bot, "send_downloaded_file"
+                    ) as download_mock, patch.object(bot, "send") as notice_mock:
+                        result = bot.send_reply_media(100, reply, "Notice", prefer_upload=True)
+
+                    self.assertEqual(result, error)
+                    api_mock.assert_called_once()
+                    download_mock.assert_not_called()
+                    notice_mock.assert_not_called()
+
+    def test_circle_notice_failure_does_not_resend_successful_media(self):
+        reply = {"video_note": {"file_id": "circle-id"}}
+        with patch.object(bot, "api", side_effect=[
+            {"ok": True, "result": {"message_id": 42}},
+            {"ok": False, "error_code": 400},
+        ]) as api_mock, patch.object(bot, "send_downloaded_file") as download_mock:
+            result = bot.send_reply_media(100, reply, "Notice", prefer_upload=True)
+
+        self.assertTrue(result["ok"])
+        self.assertEqual([call.args[0] for call in api_mock.call_args_list], ["sendVideoNote", "sendMessage"])
+        download_mock.assert_not_called()
+
     def test_escape_html_blocks_telegram_html_injection(self):
         self.assertEqual(bot.escape_html('<a href="x">&'), "&lt;a href=&quot;x&quot;&gt;&amp;")
 

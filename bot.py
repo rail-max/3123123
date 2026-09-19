@@ -702,7 +702,7 @@ def send_file(chat_id, file_id, file_type, caption="", fallback_to_upload=False)
     method = method_map.get(file_type, "sendDocument")
     if file_type in ("video_note", "sticker"):
         result = api(method, **{"chat_id": chat_id, file_type: file_id})
-        if caption:
+        if result.get("ok") and caption:
             send(chat_id, caption)
     else:
         params = {"chat_id": chat_id, file_type: file_id}
@@ -741,17 +741,19 @@ def send_reply_media(chat_id, reply_to_message: dict, caption="", prefer_upload:
     media_type, media_file_id = get_support_media(reply_to_message or {})
     if not media_type or not media_file_id:
         return {"ok": False, "description": "reply has no supported media"}
-    # Telegram can resend a photo by file_id without downloading and uploading it.
-    if media_type == "photo":
+    # Try server-side reuse before downloading and uploading reply media.
+    if media_type in REPLY_MEDIA_SAVE_TYPES:
         started_at = time.monotonic()
         result = send_file(chat_id, media_file_id, media_type, caption)
         logging.info(
-            "Reply photo file_id send elapsed=%.2fs ok=%s error_code=%s",
+            "Reply media file_id send file_type=%s elapsed=%.2fs ok=%s error_code=%s",
+            media_type,
             time.monotonic() - started_at,
             result.get("ok"),
             result.get("error_code"),
         )
-        if result.get("error_code") == 400:
+        # A timeout can hide a successful send; retry only an explicit rejection.
+        if not result.get("ok") and result.get("error_code") == 400:
             return send_downloaded_file(chat_id, media_file_id, media_type, caption)
         return result
     if prefer_upload:
