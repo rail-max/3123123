@@ -18,6 +18,7 @@ import re
 import uuid
 import urllib3
 from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 from decimal import Decimal, InvalidOperation
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -98,8 +99,17 @@ REQUIRED_CHANNEL_URL = "https://t.me/DialogDelNews"
 BUSINESS_RATE_LIMIT_PER_MINUTE = int(os.getenv("BUSINESS_RATE_LIMIT_PER_MINUTE", "120"))
 _BUSINESS_RATE_BUCKETS = {}
 _BUSINESS_REPLY_MEDIA_SENT = {}
+_BUSINESS_REPLY_MEDIA_LOCK = threading.Lock()
 _PENDING_LOCKED_MESSAGES = {}
-_TELEGRAM_HTTP = urllib3.PoolManager(num_pools=2, maxsize=4)
+_TELEGRAM_HTTP = urllib3.PoolManager(num_pools=2, maxsize=8)
+_MEDIA_EXECUTOR = ThreadPoolExecutor(max_workers=3, thread_name_prefix="reply-media")
+_MEDIA_JOB_SLOTS = threading.BoundedSemaphore(32)
+_PREFETCH_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="file-prefetch")
+_PREFETCH_JOB_SLOTS = threading.BoundedSemaphore(8)
+_FILE_PREFETCHES = OrderedDict()
+_FILE_PREFETCH_LOCK = threading.Lock()
+FILE_PREFETCH_TTL = 5 * 60
+FILE_PREFETCH_LIMIT = 128
 _REPLY_MEDIA_UPLOAD_ONLY = OrderedDict()
 _REPLY_MEDIA_UPLOAD_ONLY_LOCK = threading.Lock()
 REPLY_MEDIA_UPLOAD_ONLY_TTL = 60 * 60
@@ -160,18 +170,43 @@ def allow_business_event(owner_id: int, connection_id: str) -> bool:
     return True
 
 
-def mark_business_reply_media_sent(chat_id: int, message_id: int, media_file_id: str) -> bool:
+def mark_business_reply_media_sent(key: tuple) -> bool:
     now = int(time.time())
-    key = (chat_id, message_id, media_file_id)
-    if key in _BUSINESS_REPLY_MEDIA_SENT:
-        return False
-    _BUSINESS_REPLY_MEDIA_SENT[key] = now
-    if len(_BUSINESS_REPLY_MEDIA_SENT) > 5000:
-        cutoff = now - 24 * 60 * 60
-        stale_keys = [sent_key for sent_key, sent_at in _BUSINESS_REPLY_MEDIA_SENT.items() if sent_at < cutoff]
-        for sent_key in stale_keys:
-            _BUSINESS_REPLY_MEDIA_SENT.pop(sent_key, None)
+    with _BUSINESS_REPLY_MEDIA_LOCK:
+        if key in _BUSINESS_REPLY_MEDIA_SENT:
+            return False
+        _BUSINESS_REPLY_MEDIA_SENT[key] = now
+        if len(_BUSINESS_REPLY_MEDIA_SENT) > 5000:
+            cutoff = now - 24 * 60 * 60
+            stale_keys = [sent_key for sent_key, sent_at in _BUSINESS_REPLY_MEDIA_SENT.items() if sent_at < cutoff]
+            for sent_key in stale_keys:
+                _BUSINESS_REPLY_MEDIA_SENT.pop(sent_key, None)
     return True
+
+
+def forget_business_reply_media(key):
+    with _BUSINESS_REPLY_MEDIA_LOCK:
+        _BUSINESS_REPLY_MEDIA_SENT.pop(key, None)
+
+
+def submit_media_task(executor, slots, function, *args):
+    if not slots.acquire(blocking=False):
+        return None
+    try:
+        future = executor.submit(function, *args)
+    except Exception:
+        slots.release()
+        raise
+
+    def completed(task):
+        try:
+            if not task.cancelled() and task.exception() is not None:
+                logging.error("Background media task failed: %s", type(task.exception()).__name__)
+        finally:
+            slots.release()
+
+    future.add_done_callback(completed)
+    return future
 
 
 def create_pending_locked_message(user_id: int, event_type: str, chat_link: str, reply_to_message: dict | None = None) -> str:
@@ -424,7 +459,7 @@ def telegram_post(method, data, content_type, timeout):
         except (ValueError, UnicodeError):
             # An unparseable response must not trigger an upload fallback.
             logging.error("Invalid Telegram response for %s: HTTP %s", method, result.status)
-            return {"ok": False, "description": "Invalid Telegram response"}
+            return {"ok": False, "description": "Invalid Telegram response", "delivery_uncertain": True}
         if result.status >= 400:
             response["ok"] = False
             response.setdefault("error_code", result.status)
@@ -434,7 +469,7 @@ def telegram_post(method, data, content_type, timeout):
     except (urllib3.exceptions.HTTPError, OSError) as exc:
         # Exception text may contain a URL with the bot token.
         logging.error("Telegram API transport error for %s: %s", method, type(exc).__name__)
-        return {"ok": False, "description": type(exc).__name__}
+        return {"ok": False, "description": type(exc).__name__, "delivery_uncertain": True}
 
 
 def api(method, **params):
@@ -638,10 +673,63 @@ def send_local_file(chat_id, file_path, file_type, caption=""):
     return response
 
 
-def download_telegram_file(file_id, file_type):
+def fetch_telegram_file_info(file_id, file_type):
     started_at = time.monotonic()
     response = api("getFile", file_id=file_id)
     logging.info("Telegram getFile file_type=%s elapsed=%.2fs ok=%s", file_type, time.monotonic() - started_at, response.get("ok"))
+    return response
+
+
+def prefetch_reply_media(message):
+    if not is_reply_media_save_candidate(message):
+        return
+    media_type, file_id = get_support_media(message)
+    now = time.monotonic()
+    with _FILE_PREFETCH_LOCK:
+        for key, (expires, future) in list(_FILE_PREFETCHES.items()):
+            if expires <= now and future.done():
+                _FILE_PREFETCHES.pop(key, None)
+        if file_id in _FILE_PREFETCHES:
+            return
+        if len(_FILE_PREFETCHES) >= FILE_PREFETCH_LIMIT:
+            # Only completed lookups may be evicted, so a running one is shared.
+            completed = next((key for key, (_, job) in _FILE_PREFETCHES.items() if job.done()), None)
+            if completed is None:
+                return
+            _FILE_PREFETCHES.pop(completed)
+        future = submit_media_task(
+            _PREFETCH_EXECUTOR, _PREFETCH_JOB_SLOTS, fetch_telegram_file_info, file_id, media_type,
+        )
+        if future is not None:
+            _FILE_PREFETCHES[file_id] = (now + FILE_PREFETCH_TTL, future)
+            logging.info("Telegram getFile prefetch queued file_type=%s", media_type)
+
+
+def get_telegram_file_info(file_id, file_type):
+    with _FILE_PREFETCH_LOCK:
+        cached = _FILE_PREFETCHES.get(file_id)
+        if cached and cached[0] <= time.monotonic() and cached[1].done():
+            _FILE_PREFETCHES.pop(file_id, None)
+            cached = None
+    if cached:
+        started_at = time.monotonic()
+        try:
+            response = cached[1].result()
+        except Exception:
+            response = {"ok": False}
+        logging.info("Telegram getFile prefetch used file_type=%s wait=%.2fs ok=%s", file_type, time.monotonic() - started_at, response.get("ok"))
+        if response.get("ok") and response.get("result", {}).get("file_path"):
+            return response
+        with _FILE_PREFETCH_LOCK:
+            if _FILE_PREFETCHES.get(file_id) == cached:
+                _FILE_PREFETCHES.pop(file_id, None)
+        # An early lookup may fail before Telegram has made the file available.
+    return fetch_telegram_file_info(file_id, file_type)
+
+
+def download_telegram_file(file_id, file_type):
+    started_at = time.monotonic()
+    response = get_telegram_file_info(file_id, file_type)
     if not response.get("ok"):
         logging.error("getFile failed for file_type=%s", file_type)
         return None
@@ -807,6 +895,39 @@ def send_reply_media(chat_id, reply_to_message: dict, caption="", prefer_upload:
     return send_file(chat_id, media_file_id, media_type, caption, fallback_to_upload=True)
 
 
+def deliver_business_reply_media(owner_id, msg, key, queued_at):
+    started_at = time.monotonic()
+    delivery_started = False
+    logging.info("Reply media worker queue_wait=%.2fs", started_at - queued_at)
+    try:
+        if get_business_owner(msg["business_connection_id"]) != owner_id:
+            forget_business_reply_media(key)
+            return
+        if not db.is_sub_active(owner_id):
+            forget_business_reply_media(key)
+            send(owner_id, "Подписка закончилась. Продлите её и ответьте на сообщение ещё раз.")
+            return
+        reply = msg["reply_to_message"]
+        delivery_started = True
+        result = send_reply_media(
+            owner_id, reply,
+            reply_media_notice_caption(get_chat_link(msg["chat"]), reply.get("date", msg["date"])),
+            prefer_upload=True,
+        )
+        logging.info("Reply media worker elapsed=%.2fs ok=%s", time.monotonic() - started_at, result.get("ok"))
+        if result.get("ok"):
+            return
+        if not result.get("delivery_uncertain"):
+            forget_business_reply_media(key)
+        logging.warning("Failed to send business reply media owner_id=%s message_id=%s", owner_id, msg.get("message_id"))
+        send(owner_id, "Не удалось подтвердить отправку медиа. Telegram мог задержать ответ или файл уже недоступен.")
+    except Exception as exc:
+        # Keep the deduplication mark if delivery could already have happened.
+        if not delivery_started:
+            forget_business_reply_media(key)
+        logging.error("Business reply media worker failed: %s", type(exc).__name__)
+
+
 def message_sender_id(message: dict | None):
     if not message:
         return None
@@ -821,6 +942,8 @@ def is_reply_media_save_candidate(reply_to_message: dict | None) -> bool:
     if media_type not in REPLY_MEDIA_SAVE_TYPES or not media_file_id:
         return False
     media_payload = reply_to_message.get(media_type) or {}
+    if isinstance(media_payload, list):
+        media_payload = media_payload[-1]
     text_hint = " ".join(
         str(value).lower()
         for value in (
@@ -2152,35 +2275,29 @@ def handle_update(update: dict):
                     reply_to_message=reply_to_message,
                 )
                 return
+            key = (owner_id, conn_id, msg["chat"]["id"], replied_message_id, media_file_id)
             if (
                 replied_message_id
                 and media_file_id
-                and mark_business_reply_media_sent(msg["chat"]["id"], replied_message_id, media_file_id)
+                and mark_business_reply_media_sent(key)
             ):
-                result = send_reply_media(
-                    owner_id,
-                    reply_to_message,
-                    reply_media_notice_caption(get_chat_link(msg["chat"]), reply_to_message.get("date", msg["date"])),
-                    prefer_upload=True,
-                )
-                if not result.get("ok"):
-                    _BUSINESS_REPLY_MEDIA_SENT.pop((msg["chat"]["id"], replied_message_id, media_file_id), None)
-                    logging.warning(
-                        "Failed to send business reply media owner_id=%s connection_id=%s chat_id=%s message_id=%s",
-                        owner_id,
-                        conn_id,
-                        msg["chat"]["id"],
-                        msg.get("message_id"),
+                try:
+                    future = submit_media_task(
+                        _MEDIA_EXECUTOR, _MEDIA_JOB_SLOTS, deliver_business_reply_media,
+                        owner_id, msg, key, time.monotonic(),
                     )
-                    send(
-                        owner_id,
-                        "❌ Не удалось переслать медиа из ответа. "
-                        "Файл мог быть слишком большим, одноразовое медиа могло стать недоступным, "
-                        "или Telegram не успел отдать файл.",
-                    )
+                except Exception:
+                    forget_business_reply_media(key)
+                    raise
+                if future is None:
+                    forget_business_reply_media(key)
+                    send(owner_id, "Сейчас много запросов на сохранение. Ответьте на сообщение ещё раз чуть позже.")
 
         if sender.get("id") == owner_id or msg["chat"]["id"] == owner_id:
             return
+
+        if is_reply_media_save_candidate(msg) and db.is_sub_active(owner_id):
+            prefetch_reply_media(msg)
 
         date_str = format_ts_msk(msg["date"])
         sender_link = get_user_link(sender or msg.get("chat", {}))

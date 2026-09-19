@@ -7,6 +7,7 @@ import types
 import unittest
 import zoneinfo
 from datetime import timezone
+from concurrent.futures import Future, ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -17,6 +18,26 @@ _real_zone_info = zoneinfo.ZoneInfo
 zoneinfo.ZoneInfo = lambda _name: timezone.utc
 bot = importlib.import_module("bot")
 zoneinfo.ZoneInfo = _real_zone_info
+
+
+def submit_inline(function, *args):
+    future = Future()
+    try:
+        future.set_result(function(*args))
+    except Exception as exc:
+        future.set_exception(exc)
+    return future
+
+
+def reply_update(file_id="photo-id", message_id=10):
+    return {"business_message": {
+        "business_connection_id": "conn", "message_id": message_id + 1,
+        "date": 1, "chat": {"id": 200, "first_name": "Chat"}, "from": {"id": 100},
+        "reply_to_message": {
+            "message_id": message_id, "from": {"id": 300},
+            "has_protected_content": True, "photo": [{"file_id": file_id}],
+        },
+    }}
 
 
 class BotHandlerTests(unittest.TestCase):
@@ -35,6 +56,11 @@ class BotHandlerTests(unittest.TestCase):
         bot._BUSINESS_REPLY_MEDIA_SENT.clear()
         bot._PENDING_LOCKED_MESSAGES.clear()
         bot._REPLY_MEDIA_UPLOAD_ONLY.clear()
+        bot._FILE_PREFETCHES.clear()
+        for name in ("_MEDIA_EXECUTOR", "_PREFETCH_EXECUTOR"):
+            executor_patch = patch.object(bot, name, Mock(submit=Mock(side_effect=submit_inline)))
+            executor_patch.start()
+            self.addCleanup(executor_patch.stop)
 
     def tearDown(self):
         bot.db = self.original_db
@@ -176,6 +202,143 @@ class BotHandlerTests(unittest.TestCase):
         ):
             bot.remember_reply_media_upload_only("photo", "id", error)
         self.assertFalse(bot.reply_media_needs_upload("photo", "id"))
+
+    def test_slow_media_does_not_block_handler_or_next_media_and_is_deduplicated(self):
+        self.db.get_owner_by_connection.return_value = 100
+        first_started = threading.Event()
+        second_finished = threading.Event()
+        release_first = threading.Event()
+
+        def deliver(chat_id, reply, *args, **kwargs):
+            if reply["photo"][0]["file_id"] == "slow":
+                first_started.set()
+                release_first.wait(timeout=3)
+            else:
+                second_finished.set()
+            return {"ok": True}
+
+        with ThreadPoolExecutor(max_workers=2) as executor, patch.object(
+            bot, "_MEDIA_EXECUTOR", executor
+        ), patch.object(bot, "send_reply_media", side_effect=deliver) as sender:
+            try:
+                bot.handle_update(reply_update("slow"))
+                self.assertTrue(first_started.wait(timeout=1))
+                bot.handle_update(reply_update("slow"))
+                bot.handle_update(reply_update("fast", message_id=20))
+                self.assertTrue(second_finished.wait(timeout=1))
+                self.assertEqual(sender.call_count, 2)
+            finally:
+                release_first.set()
+                executor.shutdown(wait=True)
+
+    def test_queued_media_rechecks_subscription_and_connection(self):
+        for revoked in ("subscription", "connection"):
+            with self.subTest(revoked=revoked):
+                self.db.get_owner_by_connection.return_value = 100
+                self.db.is_sub_active.return_value = True
+                pending = Future()
+                slots = threading.BoundedSemaphore(1)
+                with patch.object(bot, "_MEDIA_JOB_SLOTS", slots), patch.object(
+                    bot, "_MEDIA_EXECUTOR", Mock(submit=Mock(return_value=pending))
+                ) as executor, patch.object(bot, "send_reply_media") as sender, patch.object(bot, "send"):
+                    bot.handle_update(reply_update())
+                    if revoked == "subscription":
+                        self.db.is_sub_active.return_value = False
+                    else:
+                        self.db.get_owner_by_connection.return_value = None
+                    function, *args = executor.submit.call_args.args
+                    function(*args)
+                    pending.set_result(None)
+                    sender.assert_not_called()
+                    self.assertEqual(bot._BUSINESS_REPLY_MEDIA_SENT, {})
+                    self.assertTrue(slots.acquire(blocking=False))
+                    slots.release()
+
+    def test_full_media_queue_allows_user_to_retry(self):
+        self.db.get_owner_by_connection.return_value = 100
+        with patch.object(bot, "_MEDIA_JOB_SLOTS", threading.BoundedSemaphore(0)), patch.object(
+            bot, "send_reply_media"
+        ) as sender, patch.object(bot, "send") as notice:
+            bot.handle_update(reply_update())
+        sender.assert_not_called()
+        notice.assert_called_once()
+        self.assertEqual(bot._BUSINESS_REPLY_MEDIA_SENT, {})
+
+    def test_uncertain_worker_delivery_is_not_repeated(self):
+        self.db.get_owner_by_connection.return_value = 100
+        with patch.object(bot, "send_reply_media", return_value={"ok": False, "delivery_uncertain": True}) as sender, patch.object(bot, "send"):
+            bot.handle_update(reply_update())
+            bot.handle_update(reply_update())
+        sender.assert_called_once()
+
+    def test_prefetch_only_prepares_incoming_protected_media_for_subscribers(self):
+        self.db.get_owner_by_connection.return_value = 100
+        msg = reply_update()["business_message"]["reply_to_message"]
+        msg.update(business_connection_id="conn", date=1, chat={"id": 200})
+        with patch.object(bot, "api", return_value={"ok": True, "result": {"file_path": "photo.jpg"}}) as api_mock, patch.object(
+            bot, "send_reply_media"
+        ) as sender, patch.object(bot, "send") as notice:
+            bot.handle_update({"business_message": msg})
+            self.assertEqual(bot.get_telegram_file_info("photo-id", "photo")["result"]["file_path"], "photo.jpg")
+        api_mock.assert_called_once_with("getFile", file_id="photo-id")
+        sender.assert_not_called()
+        notice.assert_not_called()
+
+    def test_prefetch_skips_plain_own_and_unsubscribed_messages(self):
+        self.db.get_owner_by_connection.return_value = 100
+        for reason in ("plain", "own", "unsubscribed"):
+            with self.subTest(reason=reason):
+                self.db.is_sub_active.return_value = reason != "unsubscribed"
+                msg = reply_update()["business_message"]["reply_to_message"]
+                msg.update(business_connection_id="conn", date=1, chat={"id": 200})
+                if reason == "plain":
+                    msg.pop("has_protected_content")
+                elif reason == "own":
+                    msg["from"]["id"] = 100
+                with patch.object(bot, "prefetch_reply_media") as prefetch:
+                    bot.handle_update({"business_message": msg})
+                prefetch.assert_not_called()
+
+    def test_prefetch_inflight_lookup_is_shared(self):
+        pending = Future()
+        slots = threading.BoundedSemaphore(1)
+        message = reply_update()["business_message"]["reply_to_message"]
+        with patch.object(bot, "_PREFETCH_EXECUTOR", Mock(submit=Mock(return_value=pending))) as executor, patch.object(
+            bot, "_PREFETCH_JOB_SLOTS", slots
+        ), patch.object(bot, "api") as api_mock:
+            bot.prefetch_reply_media(message)
+            bot.prefetch_reply_media(message)
+            executor.submit.assert_called_once()
+            response = {"ok": True, "result": {"file_path": "photo.jpg"}}
+            pending.set_result(response)
+            self.assertEqual(bot.get_telegram_file_info("photo-id", "photo"), response)
+            api_mock.assert_not_called()
+            self.assertTrue(slots.acquire(blocking=False))
+            slots.release()
+
+    def test_failed_prefetch_can_be_retried_when_reply_arrives(self):
+        success = {"ok": True, "result": {"file_path": "photo.jpg"}}
+        with patch.object(bot, "api", side_effect=[{"ok": False}, success]) as api_mock:
+            bot.prefetch_reply_media(reply_update()["business_message"]["reply_to_message"])
+            self.assertEqual(bot.get_telegram_file_info("photo-id", "photo"), success)
+        self.assertEqual(api_mock.call_count, 2)
+
+    def test_expired_prefetch_is_refreshed_and_cache_is_bounded(self):
+        success = {"ok": True, "result": {"file_path": "photo.jpg"}}
+        with patch.object(bot, "api", return_value=success) as api_mock, patch.object(bot, "FILE_PREFETCH_LIMIT", 2):
+            with patch.object(bot.time, "monotonic", return_value=0):
+                for file_id in ("old", "middle", "new"):
+                    bot.prefetch_reply_media(reply_update(file_id)["business_message"]["reply_to_message"])
+                self.assertEqual(list(bot._FILE_PREFETCHES), ["middle", "new"])
+            with patch.object(bot.time, "monotonic", return_value=bot.FILE_PREFETCH_TTL):
+                self.assertEqual(bot.get_telegram_file_info("new", "photo"), success)
+        self.assertEqual(api_mock.call_count, 4)
+
+    def test_prefetch_queue_full_does_not_block_or_send(self):
+        with patch.object(bot, "_PREFETCH_JOB_SLOTS", threading.BoundedSemaphore(0)), patch.object(bot, "api") as api_mock:
+            bot.prefetch_reply_media(reply_update()["business_message"]["reply_to_message"])
+        api_mock.assert_not_called()
+        self.assertEqual(bot._FILE_PREFETCHES, {})
 
     def test_escape_html_blocks_telegram_html_injection(self):
         self.assertEqual(bot.escape_html('<a href="x">&'), "&lt;a href=&quot;x&quot;&gt;&amp;")
@@ -775,6 +938,7 @@ class TelegramTransportTests(unittest.TestCase):
         for item in self.patches:
             item.start()
         bot._REPLY_MEDIA_UPLOAD_ONLY.clear()
+        bot._FILE_PREFETCHES.clear()
 
     def tearDown(self):
         for item in reversed(self.patches):
