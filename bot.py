@@ -681,9 +681,11 @@ def fetch_telegram_file_info(file_id, file_type):
 
 
 def prefetch_reply_media(message):
-    if not is_reply_media_save_candidate(message):
-        return
     media_type, file_id = get_support_media(message)
+    # Incoming media may lack the view-once flags later present in a reply.
+    # This prepares only getFile metadata; delivery still requires a valid reply.
+    if media_type not in REPLY_MEDIA_SAVE_TYPES or not file_id:
+        return
     now = time.monotonic()
     with _FILE_PREFETCH_LOCK:
         for key, (expires, future) in list(_FILE_PREFETCHES.items()):
@@ -724,6 +726,8 @@ def get_telegram_file_info(file_id, file_type):
             if _FILE_PREFETCHES.get(file_id) == cached:
                 _FILE_PREFETCHES.pop(file_id, None)
         # An early lookup may fail before Telegram has made the file available.
+    else:
+        logging.info("Telegram getFile prefetch miss file_type=%s", file_type)
     return fetch_telegram_file_info(file_id, file_type)
 
 
@@ -2296,8 +2300,15 @@ def handle_update(update: dict):
         if sender.get("id") == owner_id or msg["chat"]["id"] == owner_id:
             return
 
-        if is_reply_media_save_candidate(msg) and db.is_sub_active(owner_id):
-            prefetch_reply_media(msg)
+        incoming_media_type, incoming_file_id = get_support_media(msg)
+        if incoming_media_type in REPLY_MEDIA_SAVE_TYPES and incoming_file_id:
+            logging.info(
+                "Incoming media file_type=%s save_candidate=%s age=%.2fs",
+                incoming_media_type, is_reply_media_save_candidate(msg),
+                max(0.0, update_received_at - msg["date"]),
+            )
+            if db.is_sub_active(owner_id):
+                prefetch_reply_media(msg)
 
         date_str = format_ts_msk(msg["date"])
         sender_link = get_user_link(sender or msg.get("chat", {}))

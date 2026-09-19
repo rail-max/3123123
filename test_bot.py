@@ -284,20 +284,45 @@ class BotHandlerTests(unittest.TestCase):
         sender.assert_not_called()
         notice.assert_not_called()
 
-    def test_prefetch_skips_plain_own_and_unsubscribed_messages(self):
+    def test_prefetch_skips_unsupported_own_and_unsubscribed_messages(self):
         self.db.get_owner_by_connection.return_value = 100
-        for reason in ("plain", "own", "unsubscribed"):
+        for reason in ("unsupported", "own", "unsubscribed"):
             with self.subTest(reason=reason):
                 self.db.is_sub_active.return_value = reason != "unsubscribed"
                 msg = reply_update()["business_message"]["reply_to_message"]
                 msg.update(business_connection_id="conn", date=1, chat={"id": 200})
-                if reason == "plain":
-                    msg.pop("has_protected_content")
+                if reason == "unsupported":
+                    msg.pop("photo")
+                    msg["document"] = {"file_id": "doc-id"}
                 elif reason == "own":
                     msg["from"]["id"] = 100
                 with patch.object(bot, "prefetch_reply_media") as prefetch:
                     bot.handle_update({"business_message": msg})
                 prefetch.assert_not_called()
+
+    def test_incoming_media_without_flags_is_prepared_but_plain_replies_are_not_sent(self):
+        self.db.get_owner_by_connection.return_value = 100
+        for media_type in ("photo", "video", "video_note", "voice"):
+            with self.subTest(media_type=media_type):
+                file_id = media_type + "-plain"
+                payload = {"file_id": file_id}
+                msg = {
+                    "business_connection_id": "conn", "date": 1, "message_id": 10,
+                    "chat": {"id": 200}, "from": {"id": 300},
+                    media_type: [payload] if media_type == "photo" else payload,
+                }
+                response = {"ok": True, "result": {"file_path": "media/file"}}
+                with patch.object(bot, "api", return_value=response) as api_mock, patch.object(
+                    bot, "send_reply_media"
+                ) as sender, patch.object(bot, "send") as notice:
+                    bot.handle_update({"business_message": msg})
+                    self.assertEqual(bot.get_telegram_file_info(file_id, media_type), response)
+                    reply = reply_update()
+                    reply["business_message"]["reply_to_message"] = msg
+                    bot.handle_update(reply)
+                api_mock.assert_called_once_with("getFile", file_id=file_id)
+                sender.assert_not_called()
+                notice.assert_not_called()
 
     def test_prefetch_inflight_lookup_is_shared(self):
         pending = Future()
@@ -469,7 +494,8 @@ class BotHandlerTests(unittest.TestCase):
             }
         }
 
-        bot.handle_update(update)
+        with patch.object(bot, "prefetch_reply_media"):
+            bot.handle_update(update)
 
         self.db.cache_message.assert_called_once()
         self.db.cache_media.assert_called_once()
