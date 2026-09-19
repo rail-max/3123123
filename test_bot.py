@@ -1,9 +1,14 @@
 import importlib
+import json
 import sys
+import tempfile
+import threading
 import types
 import unittest
 import zoneinfo
 from datetime import timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from unittest.mock import Mock, patch
 
 
@@ -29,6 +34,7 @@ class BotHandlerTests(unittest.TestCase):
         bot.db = self.db
         bot._BUSINESS_REPLY_MEDIA_SENT.clear()
         bot._PENDING_LOCKED_MESSAGES.clear()
+        bot._REPLY_MEDIA_UPLOAD_ONLY.clear()
 
     def tearDown(self):
         bot.db = self.original_db
@@ -139,6 +145,37 @@ class BotHandlerTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertEqual([call.args[0] for call in api_mock.call_args_list], ["sendVideoNote", "sendMessage"])
         download_mock.assert_not_called()
+
+    def test_self_destructing_rejection_is_remembered_only_for_that_file(self):
+        error = {"ok": False, "error_code": 400, "description": "can't use file of type SelfDestructingPhoto as Photo"}
+        with patch.object(bot, "api", return_value=error) as api_mock, patch.object(
+            bot, "send_downloaded_file", return_value={"ok": True}
+        ) as download_mock:
+            for file_id in ("photo-1", "photo-1", "photo-2"):
+                self.assertTrue(bot.send_reply_media(100, {"photo": [{"file_id": file_id}]})["ok"])
+
+        self.assertEqual(api_mock.call_count, 2)
+        self.assertEqual(download_mock.call_count, 3)
+
+    def test_upload_only_cache_expires_and_has_a_size_limit(self):
+        error = {"ok": False, "error_code": 400, "description": "SelfDestructingPhoto"}
+        with patch.object(bot, "REPLY_MEDIA_UPLOAD_ONLY_LIMIT", 2), patch.object(bot.time, "monotonic", return_value=10):
+            for file_id in ("old", "middle", "new"):
+                bot.remember_reply_media_upload_only("photo", file_id, error)
+            self.assertFalse(bot.reply_media_needs_upload("photo", "old"))
+            self.assertTrue(bot.reply_media_needs_upload("photo", "new"))
+            self.assertFalse(bot.reply_media_needs_upload("video", "new"))
+        with patch.object(bot.time, "monotonic", return_value=10 + bot.REPLY_MEDIA_UPLOAD_ONLY_TTL):
+            self.assertFalse(bot.reply_media_needs_upload("photo", "new"))
+
+    def test_other_errors_do_not_poison_upload_only_cache(self):
+        for error in (
+            {"ok": False, "error_code": 400, "description": "wrong file identifier"},
+            {"ok": False, "error_code": 500, "description": "SelfDestructingPhoto"},
+            {"ok": False, "description": "timed out"},
+        ):
+            bot.remember_reply_media_upload_only("photo", "id", error)
+        self.assertFalse(bot.reply_media_needs_upload("photo", "id"))
 
     def test_escape_html_blocks_telegram_html_injection(self):
         self.assertEqual(bot.escape_html('<a href="x">&'), "&lt;a href=&quot;x&quot;&gt;&amp;")
@@ -684,6 +721,145 @@ class BotHandlerTests(unittest.TestCase):
 
         self.db.reward_referral_for_connection.assert_called_once_with(100)
         self.assertEqual(send_mock.call_count, 2)
+
+
+class TelegramTransportTests(unittest.TestCase):
+    def setUp(self):
+        class Handler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, *args):
+                pass
+
+            def handle(self):
+                try:
+                    super().handle()
+                except ConnectionResetError:
+                    # Failed downloads deliberately close an unread response.
+                    pass
+
+            def respond(self):
+                body = self.rfile.read(int(self.headers.get("Content-Length", 0)))
+                self.server.requests.append((self.client_address, self.command, self.path, body))
+                answer = self.server.answers.pop(0)
+                if answer is None:
+                    self.close_connection = True
+                    return
+                status, payload, *declared_length = answer
+                if isinstance(payload, dict):
+                    payload = json.dumps(payload).encode()
+                self.send_response(status)
+                self.send_header("Content-Length", str(declared_length[0] if declared_length else len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+                if declared_length:
+                    self.close_connection = True
+
+            do_POST = respond
+            do_GET = respond
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.server.requests = []
+        self.server.answers = []
+        self.thread = threading.Thread(target=self.server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
+        self.thread.start()
+        self.pool = bot.urllib3.PoolManager(maxsize=2)
+        self.directory = tempfile.TemporaryDirectory()
+        self.root = f"http://127.0.0.1:{self.server.server_port}"
+        self.patches = [
+            patch.object(bot, "BASE", self.root + "/botTEST"),
+            patch.object(bot, "TELEGRAM_FILE_BASE", self.root + "/file/botTEST"),
+            patch.object(bot, "_TELEGRAM_HTTP", self.pool),
+            patch.object(bot.tempfile, "tempdir", self.directory.name),
+        ]
+        for item in self.patches:
+            item.start()
+        bot._REPLY_MEDIA_UPLOAD_ONLY.clear()
+
+    def tearDown(self):
+        for item in reversed(self.patches):
+            item.stop()
+        self.pool.clear()
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=2)
+        self.directory.cleanup()
+        bot._REPLY_MEDIA_UPLOAD_ONLY.clear()
+
+    def test_photo_fallback_reuses_one_connection_for_api_download_and_upload(self):
+        payload = b"photo-content" * 50000
+        self.server.answers = [
+            (400, {"ok": False, "error_code": 400, "description": "SelfDestructingPhoto"}),
+            (200, {"ok": True, "result": {"file_path": "photos/image.jpg"}}),
+            (200, payload),
+            (200, {"ok": True, "result": {"message_id": 42}}),
+        ]
+        with self.assertLogs(level="INFO") as logs:
+            result = bot.send_reply_media(100, {"photo": [{"file_id": "photo-id"}]}, "Notice")
+
+        self.assertTrue(result["ok"])
+        requests = self.server.requests
+        self.assertEqual([item[2] for item in requests], [
+            "/botTEST/sendPhoto", "/botTEST/getFile", "/file/botTEST/photos/image.jpg", "/botTEST/sendPhoto",
+        ])
+        self.assertEqual(len({item[0] for item in requests}), 1)
+        self.assertIn(payload, requests[-1][3])
+        self.assertIn(b"Notice", requests[-1][3])
+        self.assertEqual(list(Path(self.directory.name).iterdir()), [])
+        self.assertTrue(any("Telegram getFile" in line for line in logs.output))
+        self.assertTrue(any("total_with_getFile=" in line for line in logs.output))
+
+    def test_http_errors_keep_telegram_details(self):
+        for status in (400, 403, 409, 429, 500):
+            with self.subTest(status=status):
+                response = {"ok": False, "error_code": status, "parameters": {"retry_after": 5}}
+                self.server.answers = [(status, response)]
+                self.assertEqual(bot.api("getUpdates", timeout=50), response)
+        self.assertEqual(len(self.server.requests), 5)
+
+    def test_connection_loss_after_post_does_not_replay_or_fallback(self):
+        self.server.answers = [None]
+        with patch.object(bot, "send_downloaded_file") as fallback:
+            result = bot.send_reply_media(100, {"voice": {"file_id": "voice-id"}})
+        self.assertFalse(result["ok"])
+        self.assertEqual(len(self.server.requests), 1)
+        fallback.assert_not_called()
+
+    def test_malformed_response_does_not_trigger_fallback(self):
+        self.server.answers = [(502, b"upstream unavailable")]
+        with patch.object(bot, "send_downloaded_file") as fallback:
+            result = bot.send_reply_media(100, {"video": {"file_id": "video-id"}})
+        self.assertFalse(result["ok"])
+        fallback.assert_not_called()
+
+    def test_failed_download_leaves_no_temp_file(self):
+        self.server.answers = [
+            (200, {"ok": True, "result": {"file_path": "photos/expired.jpg"}}),
+            (404, b"not found"),
+        ]
+        self.assertIsNone(bot.download_telegram_file("id", "photo"))
+        self.assertEqual(list(Path(self.directory.name).iterdir()), [])
+
+    def test_upload_connection_loss_does_not_resend_photo_as_document(self):
+        self.server.answers = [
+            (200, {"ok": True, "result": {"file_path": "photos/image.jpg"}}),
+            (200, b"photo-content"),
+            None,
+        ]
+        self.assertFalse(bot.send_downloaded_file(100, "id", "photo")["ok"])
+        self.assertEqual(len(self.server.requests), 3)
+        self.assertEqual(list(Path(self.directory.name).iterdir()), [])
+
+    def test_truncated_download_is_removed_and_connection_is_replaced(self):
+        self.server.answers = [
+            (200, {"ok": True, "result": {"file_path": "photos/image.jpg"}}),
+            (200, b"partial", 100),
+            (200, {"ok": True}),
+        ]
+        self.assertIsNone(bot.download_telegram_file("id", "photo"))
+        self.assertEqual(list(Path(self.directory.name).iterdir()), [])
+        self.assertTrue(bot.api("getMe")["ok"])
+        self.assertNotEqual(self.server.requests[1][0], self.server.requests[2][0])
 
 
 if __name__ == "__main__":

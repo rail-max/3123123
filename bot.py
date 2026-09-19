@@ -16,6 +16,8 @@ import hmac
 import html
 import re
 import uuid
+import urllib3
+from collections import OrderedDict
 from decimal import Decimal, InvalidOperation
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -37,6 +39,7 @@ from config import (
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
 
 BASE = f"https://api.telegram.org/bot{BOT_TOKEN}"
+TELEGRAM_FILE_BASE = f"https://api.telegram.org/file/bot{BOT_TOKEN}"
 INSTRUCTION_IMAGE_PATHS = [
     os.path.join(os.path.dirname(__file__), "instruction.jpg"),
     os.path.join(os.path.dirname(__file__), "instruction.png"),
@@ -96,6 +99,11 @@ BUSINESS_RATE_LIMIT_PER_MINUTE = int(os.getenv("BUSINESS_RATE_LIMIT_PER_MINUTE",
 _BUSINESS_RATE_BUCKETS = {}
 _BUSINESS_REPLY_MEDIA_SENT = {}
 _PENDING_LOCKED_MESSAGES = {}
+_TELEGRAM_HTTP = urllib3.PoolManager(num_pools=2, maxsize=4)
+_REPLY_MEDIA_UPLOAD_ONLY = OrderedDict()
+_REPLY_MEDIA_UPLOAD_ONLY_LOCK = threading.Lock()
+REPLY_MEDIA_UPLOAD_ONLY_TTL = 60 * 60
+REPLY_MEDIA_UPLOAD_ONLY_LIMIT = 2048
 TELEGRAM_FILE_DOWNLOAD_TIMEOUT = int(os.getenv("TELEGRAM_FILE_DOWNLOAD_TIMEOUT", "180"))
 TELEGRAM_FILE_UPLOAD_TIMEOUT = int(os.getenv("TELEGRAM_FILE_UPLOAD_TIMEOUT", "180"))
 TELEGRAM_MESSAGE_LIMIT = 4096
@@ -400,28 +408,38 @@ def get_settings(user_id: int) -> dict:
     return db.get_user_settings(user_id)
 
 
-def api(method, **params):
-    url = f"{BASE}/{method}"
-    data = json.dumps(params).encode()
-    req = urllib.request.Request(url, data=data,
-                                  headers={"Content-Type": "application/json"})
-    timeout = 65 if method == "getUpdates" else 20
+def telegram_post(method, data, content_type, timeout):
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            response = json.loads(r.read().decode("utf-8"))
-            if not response.get("ok"):
-                logging.error("Telegram API returned error for %s: %s", method, response)
-            return response
-    except urllib.error.HTTPError as exc:
+        # Never replay a POST: a lost response can still mean delivery succeeded.
+        result = _TELEGRAM_HTTP.request(
+            "POST", f"{BASE}/{method}", body=data,
+            headers={"Content-Type": content_type},
+            timeout=urllib3.Timeout(connect=10, read=timeout),
+            retries=False, redirect=False,
+        )
         try:
-            response = json.loads(exc.read().decode("utf-8"))
-        except Exception:
-            response = {"ok": False, "error_code": exc.code, "description": str(exc.reason)}
-        logging.error("Telegram API HTTP error for %s: %s", method, response)
+            response = json.loads(result.data.decode("utf-8"))
+            if not isinstance(response, dict):
+                raise ValueError("Expected a JSON object")
+        except (ValueError, UnicodeError):
+            # An unparseable response must not trigger an upload fallback.
+            logging.error("Invalid Telegram response for %s: HTTP %s", method, result.status)
+            return {"ok": False, "description": "Invalid Telegram response"}
+        if result.status >= 400:
+            response["ok"] = False
+            response.setdefault("error_code", result.status)
+        if not response.get("ok"):
+            logging.error("Telegram API returned error for %s: %s", method, response)
         return response
-    except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError) as exc:
-        logging.error("Telegram API transport error for %s: %s", method, exc)
-        return {"ok": False, "description": str(exc)}
+    except (urllib3.exceptions.HTTPError, OSError) as exc:
+        # Exception text may contain a URL with the bot token.
+        logging.error("Telegram API transport error for %s: %s", method, type(exc).__name__)
+        return {"ok": False, "description": type(exc).__name__}
+
+
+def api(method, **params):
+    timeout = 65 if method == "getUpdates" else 20
+    return telegram_post(method, json.dumps(params).encode(), "application/json", timeout)
 
 
 def is_required_channel_member(user_id: int) -> bool:
@@ -521,17 +539,7 @@ def send_photo(chat_id, photo_path, caption="", keyboard=None):
     body.extend(photo_data)
     body.extend(f"\r\n--{boundary}--\r\n".encode())
 
-    url = f"{BASE}/sendPhoto"
-    req = urllib.request.Request(url, data=bytes(body), headers={"Content-Type": f"multipart/form-data; boundary={boundary}"})
-    try:
-        with urllib.request.urlopen(req, timeout=20) as r:
-            response = json.loads(r.read())
-            if not response.get("ok"):
-                logging.error("Telegram API returned error for sendPhoto: %s", response)
-            return response
-    except Exception as exc:
-        logging.error("sendPhoto failed for chat_id=%s path=%s: %s", chat_id, photo_path, exc)
-        return {"ok": False}
+    return telegram_post("sendPhoto", bytes(body), f"multipart/form-data; boundary={boundary}", 20)
 
 
 def send_invoice(chat_id: int, title: str, description: str, payload: str, amount: int):
@@ -619,29 +627,21 @@ def send_local_file(chat_id, file_path, file_type, caption=""):
     body.extend(media_data)
     body.extend(f"\r\n--{boundary}--\r\n".encode())
 
-    req = urllib.request.Request(
-        f"{BASE}/{method}",
-        data=bytes(body),
-        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
-    )
     started_at = time.monotonic()
-    try:
-        with urllib.request.urlopen(req, timeout=TELEGRAM_FILE_UPLOAD_TIMEOUT) as r:
-            response = json.loads(r.read().decode("utf-8"))
-            logging.info("Telegram media upload file_type=%s elapsed=%.2fs ok=%s", file_type, time.monotonic() - started_at, response.get("ok"))
-            if not response.get("ok"):
-                logging.error("Telegram API returned error for %s upload: %s", method, response)
-            elif caption and file_type in MEDIA_WITHOUT_CAPTION:
-                send(chat_id, caption)
-            return response
-    except Exception as exc:
-        logging.error("send_local_file failed for chat_id=%s file_type=%s path=%s: %s", chat_id, file_type, file_path, exc)
-        return {"ok": False}
+    response = telegram_post(
+        method, bytes(body), f"multipart/form-data; boundary={boundary}",
+        TELEGRAM_FILE_UPLOAD_TIMEOUT,
+    )
+    logging.info("Telegram media upload file_type=%s elapsed=%.2fs ok=%s", file_type, time.monotonic() - started_at, response.get("ok"))
+    if response.get("ok") and caption and file_type in MEDIA_WITHOUT_CAPTION:
+        send(chat_id, caption)
+    return response
 
 
 def download_telegram_file(file_id, file_type):
     started_at = time.monotonic()
     response = api("getFile", file_id=file_id)
+    logging.info("Telegram getFile file_type=%s elapsed=%.2fs ok=%s", file_type, time.monotonic() - started_at, response.get("ok"))
     if not response.get("ok"):
         logging.error("getFile failed for file_type=%s", file_type)
         return None
@@ -656,20 +656,37 @@ def download_telegram_file(file_id, file_type):
     temp_path = temp_file.name
     temp_file.close()
 
-    file_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{urllib.parse.quote(file_path, safe='/')}"
+    file_url = f"{TELEGRAM_FILE_BASE}/{urllib.parse.quote(file_path, safe='/')}"
+    download_started_at = time.monotonic()
+    response = None
     try:
-        with urllib.request.urlopen(file_url, timeout=TELEGRAM_FILE_DOWNLOAD_TIMEOUT) as response:
-            with open(temp_path, "wb") as output:
-                shutil.copyfileobj(response, output)
-        logging.info("Telegram media download file_type=%s elapsed=%.2fs", file_type, time.monotonic() - started_at)
+        response = _TELEGRAM_HTTP.request(
+            "GET", file_url, preload_content=False,
+            timeout=urllib3.Timeout(connect=10, read=TELEGRAM_FILE_DOWNLOAD_TIMEOUT),
+            retries=False, redirect=False,
+        )
+        if response.status != 200:
+            raise ValueError(f"HTTP {response.status}")
+        with open(temp_path, "wb") as output:
+            shutil.copyfileobj(response, output, length=256 * 1024)
+        logging.info(
+            "Telegram media download file_type=%s elapsed=%.2fs total_with_getFile=%.2fs bytes=%s",
+            file_type, time.monotonic() - download_started_at,
+            time.monotonic() - started_at, os.path.getsize(temp_path),
+        )
         return temp_path
     except Exception as exc:
-        logging.error("Telegram file download failed for file_type=%s path=%s: %s", file_type, file_path, exc)
+        logging.error("Telegram file download failed for file_type=%s: %s", file_type, type(exc).__name__)
+        if response is not None:
+            response.close()
         try:
             os.unlink(temp_path)
         except OSError:
             pass
         return None
+    finally:
+        if response is not None:
+            response.release_conn()
 
 
 def send_downloaded_file(chat_id, file_id, file_type, caption=""):
@@ -678,7 +695,7 @@ def send_downloaded_file(chat_id, file_id, file_type, caption=""):
         return {"ok": False}
     try:
         result = send_local_file(chat_id, temp_path, file_type, caption)
-        if not result.get("ok") and file_type == "photo":
+        if not result.get("ok") and result.get("error_code") == 400 and file_type == "photo":
             return send_local_file(chat_id, temp_path, "document", caption)
         return result
     finally:
@@ -712,7 +729,7 @@ def send_file(chat_id, file_id, file_type, caption="", fallback_to_upload=False)
         result = api(method, **params)
     if not result.get("ok"):
         logging.error("send_file failed for chat_id=%s file_type=%s", chat_id, file_type)
-        if fallback_to_upload:
+        if fallback_to_upload and result.get("error_code") == 400:
             return send_downloaded_file(chat_id, file_id, file_type, caption)
     return result
 
@@ -737,12 +754,40 @@ def get_support_media(msg: dict):
     return None, None
 
 
+def reply_media_needs_upload(media_type, file_id):
+    key = (media_type, file_id)
+    with _REPLY_MEDIA_UPLOAD_ONLY_LOCK:
+        expires = _REPLY_MEDIA_UPLOAD_ONLY.get(key)
+        if expires is None:
+            return False
+        if expires <= time.monotonic():
+            _REPLY_MEDIA_UPLOAD_ONLY.pop(key, None)
+            return False
+        return True
+
+
+def remember_reply_media_upload_only(media_type, file_id, result):
+    if result.get("ok") or result.get("error_code") != 400:
+        return
+    if "selfdestructing" not in str(result.get("description", "")).lower():
+        return
+    with _REPLY_MEDIA_UPLOAD_ONLY_LOCK:
+        key = (media_type, file_id)
+        _REPLY_MEDIA_UPLOAD_ONLY[key] = time.monotonic() + REPLY_MEDIA_UPLOAD_ONLY_TTL
+        _REPLY_MEDIA_UPLOAD_ONLY.move_to_end(key)
+        while len(_REPLY_MEDIA_UPLOAD_ONLY) > REPLY_MEDIA_UPLOAD_ONLY_LIMIT:
+            _REPLY_MEDIA_UPLOAD_ONLY.popitem(last=False)
+
+
 def send_reply_media(chat_id, reply_to_message: dict, caption="", prefer_upload: bool = False):
     media_type, media_file_id = get_support_media(reply_to_message or {})
     if not media_type or not media_file_id:
         return {"ok": False, "description": "reply has no supported media"}
     # Try server-side reuse before downloading and uploading reply media.
     if media_type in REPLY_MEDIA_SAVE_TYPES:
+        if reply_media_needs_upload(media_type, media_file_id):
+            logging.info("Reply media known self-destructing file_type=%s: using upload", media_type)
+            return send_downloaded_file(chat_id, media_file_id, media_type, caption)
         started_at = time.monotonic()
         result = send_file(chat_id, media_file_id, media_type, caption)
         logging.info(
@@ -754,6 +799,7 @@ def send_reply_media(chat_id, reply_to_message: dict, caption="", prefer_upload:
         )
         # A timeout can hide a successful send; retry only an explicit rejection.
         if not result.get("ok") and result.get("error_code") == 400:
+            remember_reply_media_upload_only(media_type, media_file_id, result)
             return send_downloaded_file(chat_id, media_file_id, media_type, caption)
         return result
     if prefer_upload:
