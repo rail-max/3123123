@@ -1436,6 +1436,7 @@ def send_instruction(chat_id: int):
         "inline_keyboard": [
             [{"text": "📄 Скопировать", "copy_text": {"text": copy_text}}],
             [{"text": "👌 Подключить", "url": "tg://settings/edit"}],
+            [{"text": "Пример работы", "url": "https://t.me/DialogDelNews/11"}],
         ]
     }
     image_path = next((path for path in INSTRUCTION_IMAGE_PATHS if os.path.exists(path)), None)
