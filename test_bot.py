@@ -68,6 +68,20 @@ class BotHandlerTests(unittest.TestCase):
     def tearDown(self):
         bot.db = self.original_db
 
+    def test_instruction_has_example_post_button_with_and_without_image(self):
+        for has_image in (False, True):
+            with self.subTest(has_image=has_image), patch.object(bot.os.path, "exists", return_value=has_image), patch.object(
+                bot, "send_photo"
+            ) as photo, patch.object(bot, "send") as send, patch.object(bot, "BOT_USERNAME", "DialogDelBot"):
+                bot.send_instruction(100)
+                rows = send.call_args.kwargs["keyboard"]["inline_keyboard"]
+                self.assertEqual(rows[0][0]["copy_text"]["text"], "@DialogDelBot")
+                self.assertEqual(rows[1][0]["url"], "tg://settings/edit")
+                self.assertNotIn("style", rows[0][0])
+                self.assertEqual(rows[1][0]["style"], "success")
+                self.assertEqual(rows[2], [{"text": "Пример работы", "url": "https://t.me/DialogDelNews/11", "style": "primary"}])
+                self.assertEqual(photo.call_count, int(has_image))
+
     def test_reply_photo_uses_file_id_without_download_when_accepted(self):
         reply = {"photo": [{"file_id": "small-photo"}, {"file_id": "big-photo"}]}
 
@@ -882,6 +896,18 @@ class BotHandlerTests(unittest.TestCase):
         invoice_call = [call for call in api_mock.call_args_list if call.args and call.args[0] == "sendInvoice"][0]
         self.assertEqual(invoice_call.kwargs["payload"], "daily")
         self.assertEqual(invoice_call.kwargs["prices"][0]["amount"], 35)
+        self.assertEqual(invoice_call.kwargs["reply_markup"]["inline_keyboard"], [
+            [{"text": "Оплатить 35 Stars", "pay": True, "style": "success"}],
+        ])
+
+    def test_expired_payment_buttons_are_green_but_referral_is_unchanged(self):
+        with patch.object(bot, "get_ref_link", return_value="https://t.me/DialogDelBot?start=ref100"):
+            rows = bot.expired_payment_keyboard(100)["inline_keyboard"]
+        self.assertEqual([row[0]["callback_data"] for row in rows[:-1]], [
+            "buy_daily", "buy_weekly", "buy_monthly", "buy_yearly", "buy_platega_monthly",
+        ])
+        self.assertTrue(all(row[0]["style"] == "success" for row in rows[:-1]))
+        self.assertNotIn("style", rows[-1][0])
 
     def test_daily_pre_checkout_is_accepted(self):
         update = {

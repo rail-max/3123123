@@ -584,7 +584,8 @@ def send_invoice(chat_id: int, title: str, description: str, payload: str, amoun
         description=description,
         payload=payload,
         currency="XTR",
-        prices=[{"label": title, "amount": amount}]
+        prices=[{"label": title, "amount": amount}],
+        reply_markup={"inline_keyboard": [[{"text": f"Оплатить {amount} Stars", "pay": True, "style": "success"}]]},
     )
     if not result.get("ok"):
         logging.error("sendInvoice failed for chat_id=%s payload=%s amount=%s", chat_id, payload, amount)
@@ -602,7 +603,7 @@ def stars_plan_lines(unit: str = "Stars") -> str:
 
 def stars_plan_keyboard_rows():
     return [
-        [{"text": f"⭐ {stars_plan_label(payload)}", "callback_data": f"buy_{payload}"}]
+        [{"text": f"⭐ {stars_plan_label(payload)}", "callback_data": f"buy_{payload}", "style": "success"}]
         for payload in STAR_PLAN_ORDER
     ]
 
@@ -1335,7 +1336,7 @@ def expired_details_text(user_id: int, event_type: str = "deleted") -> str:
 def expired_payment_keyboard(user_id: int):
     return {
         "inline_keyboard": stars_plan_keyboard_rows() + [
-            [{"text": "💳 30 дней — 120 ₽ (СБП / QR)", "callback_data": "buy_platega_monthly"}],
+            [{"text": "💳 30 дней — 120 ₽ (СБП / QR)", "callback_data": "buy_platega_monthly", "style": "success"}],
             [{"text": "👥 Пригласить друга", "url": get_ref_link(user_id)}],
         ]
     }
@@ -1435,8 +1436,8 @@ def send_instruction(chat_id: int):
     keyboard = {
         "inline_keyboard": [
             [{"text": "📄 Скопировать", "copy_text": {"text": copy_text}}],
-            [{"text": "👌 Подключить", "url": "tg://settings/edit"}],
-            [{"text": "Пример работы", "url": "https://t.me/DialogDelNews/11"}],
+            [{"text": "👌 Подключить", "url": "tg://settings/edit", "style": "success"}],
+            [{"text": "Пример работы", "url": "https://t.me/DialogDelNews/11", "style": "primary"}],
         ]
     }
     image_path = next((path for path in INSTRUCTION_IMAGE_PATHS if os.path.exists(path)), None)
@@ -1856,7 +1857,7 @@ def handle_update(update: dict):
                 "💳 СБП / QR через Platega: 30 дней — 120 ₽",
                 keyboard={
                     "inline_keyboard": stars_plan_keyboard_rows() + [
-                        [{"text": "💳 30 дней — 120 ₽ (СБП / QR)", "callback_data": "buy_platega_monthly"}],
+                        [{"text": "💳 30 дней — 120 ₽ (СБП / QR)", "callback_data": "buy_platega_monthly", "style": "success"}],
                     ]
                 }
             )
@@ -2243,7 +2244,7 @@ def handle_update(update: dict):
                 "💳 <b>Оплата 30 дней — 120 ₽</b>\n\n"
                 "Открой страницу оплаты, отсканируй QR-код или оплати через СБП. "
                 "После подтверждения подписка активируется автоматически.",
-                keyboard={"inline_keyboard": [[{"text": "Оплатить 120 ₽", "url": payment_url}]]},
+                keyboard={"inline_keyboard": [[{"text": "Оплатить 120 ₽", "url": payment_url, "style": "success"}]]},
             )
         elif data.startswith("buy_") and data.replace("buy_", "", 1) in PAYMENT_PLANS:
             payload = data.replace("buy_", "", 1)
