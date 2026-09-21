@@ -9,7 +9,6 @@ import time
 import logging
 import sys
 import os
-import shutil
 import tempfile
 import threading
 import hmac
@@ -109,7 +108,8 @@ _PREFETCH_JOB_SLOTS = threading.BoundedSemaphore(8)
 _FILE_PREFETCHES = OrderedDict()
 _FILE_PREFETCH_LOCK = threading.Lock()
 FILE_PREFETCH_TTL = 5 * 60
-FILE_PREFETCH_LIMIT = 128
+FILE_PREFETCH_LIMIT = 32
+FILE_PREFETCH_MAX_BYTES = 2 * 1024 * 1024
 _REPLY_MEDIA_UPLOAD_ONLY = OrderedDict()
 _REPLY_MEDIA_UPLOAD_ONLY_LOCK = threading.Lock()
 REPLY_MEDIA_UPLOAD_ONLY_TTL = 60 * 60
@@ -680,10 +680,29 @@ def fetch_telegram_file_info(file_id, file_type):
     return response
 
 
+def prepare_telegram_media(file_id, file_type):
+    started_at = time.monotonic()
+    response = fetch_telegram_file_info(file_id, file_type)
+    info = response.get("result", {})
+    if not response.get("ok") or not info.get("file_path"):
+        return response
+    if (info.get("file_size") or 0) > FILE_PREFETCH_MAX_BYTES:
+        return response
+    path = download_file_from_info(response, file_type, max_bytes=FILE_PREFETCH_MAX_BYTES, started_at=started_at)
+    if path:
+        try:
+            with open(path, "rb") as source:
+                response = dict(response, _prefetched_bytes=source.read())
+            logging.info("Telegram media prefetch ready file_type=%s bytes=%s", file_type, len(response["_prefetched_bytes"]))
+        finally:
+            os.unlink(path)
+    return response
+
+
 def prefetch_reply_media(message):
     media_type, file_id = get_support_media(message)
     # Incoming media may lack the view-once flags later present in a reply.
-    # This prepares only getFile metadata; delivery still requires a valid reply.
+    # Prepare small files too; delivery still requires an authorized reply.
     if media_type not in REPLY_MEDIA_SAVE_TYPES or not file_id:
         return
     now = time.monotonic()
@@ -700,7 +719,7 @@ def prefetch_reply_media(message):
                 return
             _FILE_PREFETCHES.pop(completed)
         future = submit_media_task(
-            _PREFETCH_EXECUTOR, _PREFETCH_JOB_SLOTS, fetch_telegram_file_info, file_id, media_type,
+            _PREFETCH_EXECUTOR, _PREFETCH_JOB_SLOTS, prepare_telegram_media, file_id, media_type,
         )
         if future is not None:
             _FILE_PREFETCHES[file_id] = (now + FILE_PREFETCH_TTL, future)
@@ -734,6 +753,22 @@ def get_telegram_file_info(file_id, file_type):
 def download_telegram_file(file_id, file_type):
     started_at = time.monotonic()
     response = get_telegram_file_info(file_id, file_type)
+    if "_prefetched_bytes" in response:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=MEDIA_FILE_SUFFIXES.get(file_type, "")) as output:
+            try:
+                output.write(response["_prefetched_bytes"])
+            except Exception:
+                output.close()
+                os.unlink(output.name)
+                raise
+        logging.info("Telegram media prefetch hit file_type=%s", file_type)
+        return output.name
+    return download_file_from_info(response, file_type, started_at=started_at)
+
+
+def download_file_from_info(response, file_type, max_bytes=None, started_at=None):
+    if started_at is None:
+        started_at = time.monotonic()
     if not response.get("ok"):
         logging.error("getFile failed for file_type=%s", file_type)
         return None
@@ -760,7 +795,15 @@ def download_telegram_file(file_id, file_type):
         if response.status != 200:
             raise ValueError(f"HTTP {response.status}")
         with open(temp_path, "wb") as output:
-            shutil.copyfileobj(response, output, length=256 * 1024)
+            total = 0
+            while True:
+                chunk = response.read(256 * 1024)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if max_bytes is not None and total > max_bytes:
+                    raise ValueError("Prefetch size limit exceeded")
+                output.write(chunk)
         logging.info(
             "Telegram media download file_type=%s elapsed=%.2fs total_with_getFile=%.2fs bytes=%s",
             file_type, time.monotonic() - download_started_at,
@@ -875,6 +918,16 @@ def send_reply_media(chat_id, reply_to_message: dict, caption="", prefer_upload:
     media_type, media_file_id = get_support_media(reply_to_message or {})
     if not media_type or not media_file_id:
         return {"ok": False, "description": "reply has no supported media"}
+    with _FILE_PREFETCH_LOCK:
+        cached = _FILE_PREFETCHES.get(media_file_id)
+        ready = cached and cached[0] > time.monotonic() and cached[1].done()
+        if ready:
+            try:
+                ready = "_prefetched_bytes" in cached[1].result()
+            except Exception:
+                ready = False
+    if ready:
+        return send_downloaded_file(chat_id, media_file_id, media_type, caption)
     # Try server-side reuse before downloading and uploading reply media.
     if media_type in REPLY_MEDIA_SAVE_TYPES:
         if reply_media_needs_upload(media_type, media_file_id):

@@ -57,6 +57,9 @@ class BotHandlerTests(unittest.TestCase):
         bot._PENDING_LOCKED_MESSAGES.clear()
         bot._REPLY_MEDIA_UPLOAD_ONLY.clear()
         bot._FILE_PREFETCHES.clear()
+        download_patch = patch.object(bot, "download_file_from_info", return_value=None)
+        self.download_mock = download_patch.start()
+        self.addCleanup(download_patch.stop)
         for name in ("_MEDIA_EXECUTOR", "_PREFETCH_EXECUTOR"):
             executor_patch = patch.object(bot, name, Mock(submit=Mock(side_effect=submit_inline)))
             executor_patch.start()
@@ -364,6 +367,29 @@ class BotHandlerTests(unittest.TestCase):
             bot.prefetch_reply_media(reply_update()["business_message"]["reply_to_message"])
         api_mock.assert_not_called()
         self.assertEqual(bot._FILE_PREFETCHES, {})
+
+    def test_large_prefetch_keeps_metadata_without_downloading(self):
+        response = {"ok": True, "result": {"file_path": "video.mp4", "file_size": bot.FILE_PREFETCH_MAX_BYTES + 1}}
+        with patch.object(bot, "api", return_value=response):
+            self.assertEqual(bot.prepare_telegram_media("large", "video"), response)
+        self.download_mock.assert_not_called()
+
+    def test_cached_bytes_are_reused_for_each_supported_media_type(self):
+        for media_type in ("photo", "video", "video_note", "voice"):
+            with self.subTest(media_type=media_type):
+                future = Future()
+                future.set_result({"ok": True, "result": {"file_path": "media/file"}, "_prefetched_bytes": b"cached-content"})
+                bot._FILE_PREFETCHES[media_type] = (bot.time.monotonic() + 60, future)
+                payload = {"file_id": media_type}
+                reply = {media_type: [payload] if media_type == "photo" else payload}
+                def upload(chat_id, path, file_type, caption):
+                    self.assertEqual(Path(path).read_bytes(), b"cached-content")
+                    self.assertEqual((chat_id, file_type, caption), (100, media_type, "Notice"))
+                    return {"ok": True}
+                with patch.object(bot, "send_local_file", side_effect=upload), patch.object(bot, "api") as api_mock:
+                    self.assertTrue(bot.send_reply_media(100, reply, "Notice")["ok"])
+                api_mock.assert_not_called()
+        self.download_mock.assert_not_called()
 
     def test_escape_html_blocks_telegram_html_injection(self):
         self.assertEqual(bot.escape_html('<a href="x">&'), "&lt;a href=&quot;x&quot;&gt;&amp;")
@@ -998,6 +1024,54 @@ class TelegramTransportTests(unittest.TestCase):
         self.assertEqual(list(Path(self.directory.name).iterdir()), [])
         self.assertTrue(any("Telegram getFile" in line for line in logs.output))
         self.assertTrue(any("total_with_getFile=" in line for line in logs.output))
+
+    def test_background_prefetch_downloads_once_and_reply_only_uploads(self):
+        self.server.answers = [
+            (200, {"ok": True, "result": {"file_path": "photos/image.jpg"}}),
+            (200, b"prepared-photo"),
+            (200, {"ok": True, "result": {"message_id": 42}}),
+        ]
+        reply = {"photo": [{"file_id": "prepared"}]}
+        with ThreadPoolExecutor(max_workers=1) as executor, patch.object(bot, "_PREFETCH_EXECUTOR", executor):
+            bot.prefetch_reply_media(reply)
+            with bot._FILE_PREFETCH_LOCK:
+                future = bot._FILE_PREFETCHES["prepared"][1]
+            self.assertEqual(future.result(timeout=5)["_prefetched_bytes"], b"prepared-photo")
+            self.assertEqual(len(self.server.requests), 2)
+            self.assertEqual(list(Path(self.directory.name).iterdir()), [])
+            self.assertTrue(bot.send_reply_media(100, reply, "Notice")["ok"])
+        self.assertEqual([item[2] for item in self.server.requests], [
+            "/botTEST/getFile", "/file/botTEST/photos/image.jpg", "/botTEST/sendPhoto",
+        ])
+        self.assertIn(b"prepared-photo", self.server.requests[-1][3])
+        self.assertEqual(list(Path(self.directory.name).iterdir()), [])
+
+    def test_prefetch_limits_actual_bytes_even_without_reported_size(self):
+        self.server.answers = [
+            (200, {"ok": True, "result": {"file_path": "photos/image.jpg"}}),
+            (200, b"larger-than-budget"),
+        ]
+        with patch.object(bot, "FILE_PREFETCH_MAX_BYTES", 4):
+            result = bot.prepare_telegram_media("id", "photo")
+        self.assertTrue(result["ok"])
+        self.assertNotIn("_prefetched_bytes", result)
+        self.assertEqual(list(Path(self.directory.name).iterdir()), [])
+
+    def test_failed_early_download_can_download_again_on_reply(self):
+        self.server.answers = [
+            (200, {"ok": True, "result": {"file_path": "photos/image.jpg"}}),
+            (404, b"not-ready"),
+            (200, b"now-ready"),
+        ]
+        prepared = bot.prepare_telegram_media("id", "photo")
+        self.assertNotIn("_prefetched_bytes", prepared)
+        future = Future()
+        future.set_result(prepared)
+        bot._FILE_PREFETCHES["id"] = (bot.time.monotonic() + 60, future)
+        path = bot.download_telegram_file("id", "photo")
+        self.assertEqual(Path(path).read_bytes(), b"now-ready")
+        Path(path).unlink()
+        self.assertEqual(len(self.server.requests), 3)
 
     def test_http_errors_keep_telegram_details(self):
         for status in (400, 403, 409, 429, 500):
