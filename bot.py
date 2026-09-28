@@ -80,6 +80,27 @@ MENU_ACTION_TEXTS = {
     "💬 Поддержка",
     "◀️ Назад",
 }
+BOT_COMMANDS = [
+    {"command": "start", "description": "Запуск и подключение бота"},
+    {"command": "status", "description": "Подключение и статус подписки"},
+    {"command": "settings", "description": "Настройки отслеживания"},
+    {"command": "subscription", "description": "Купить или продлить подписку"},
+    {"command": "help", "description": "Инструкция и пример работы"},
+    {"command": "privacy", "description": "Приватность и безопасность"},
+    {"command": "referral", "description": "Пригласить друга"},
+    {"command": "documents", "description": "Документы и тарифы"},
+    {"command": "support", "description": "Написать в поддержку"},
+]
+COMMAND_ACTIONS = {
+    "/status": "📊 Статус",
+    "/settings": "⚙️ Настройки",
+    "/subscription": "💳 Подписка",
+    "/help": "📖 Инструкция",
+    "/privacy": "🔒 Приватность",
+    "/referral": "👥 Рефералка",
+    "/documents": "📄 Документы",
+    "/support": "💬 Поддержка",
+}
 
 ALLOWED_UPDATES = [
     "message",
@@ -477,6 +498,17 @@ def api(method, **params):
     return telegram_post(method, json.dumps(params).encode(), "application/json", timeout)
 
 
+def setup_command_menu():
+    for scope in ("default", "all_private_chats"):
+        for language in ("", "ru"):
+            result = api("setMyCommands", commands=BOT_COMMANDS, scope={"type": scope}, language_code=language)
+            if not result.get("ok"):
+                logging.warning("Command menu setup failed scope=%s language=%s", scope, language)
+    result = api("setChatMenuButton", menu_button={"type": "commands"})
+    if not result.get("ok"):
+        logging.warning("Command menu button setup failed")
+
+
 def is_required_channel_member(user_id: int) -> bool:
     result = api("getChatMember", chat_id=REQUIRED_CHANNEL_USERNAME, user_id=user_id)
     if not result.get("ok"):
@@ -512,8 +544,8 @@ def send_subscription_gate(chat_id: int):
 
 
 def send_start_flow(chat_id: int):
-    send_instruction(chat_id)
-    return send(chat_id, "Главное меню:", keyboard=main_keyboard())
+    send(chat_id, "Добро пожаловать в DialogDelBot!", keyboard=main_keyboard())
+    return send_instruction(chat_id)
 
 
 def unlock_start_after_channel(user_id: int, chat_id: int):
@@ -1379,16 +1411,8 @@ def send_expired_message(
 
 
 def main_keyboard():
-    return {
-        "keyboard": [
-            [{"text": "📊 Статус"}, {"text": "⚙️ Настройки"}, {"text": "💳 Подписка"}],
-            [{"text": "📖 Инструкция"}, {"text": "🔒 Приватность"}, {"text": "👥 Рефералка"}],
-            [{"text": "📄 Документы"}, {"text": "💬 Поддержка"}],
-        ],
-        "resize_keyboard": True,
-        "is_persistent": True,
-        "input_field_placeholder": "Выберите действие",
-    }
+    # Remove keyboards left in existing chats by earlier bot versions.
+    return {"remove_keyboard": True}
 
 
 def settings_keyboard(user_id: int):
@@ -1396,14 +1420,10 @@ def settings_keyboard(user_id: int):
     del_icon = "✅" if s["track_deleted"] else "❌"
     edit_icon = "✅" if s["track_edited"] else "❌"
     return {
-        "keyboard": [
-            [{"text": f"{del_icon} Удалённые сообщения"}],
-            [{"text": f"{edit_icon} Изменённые сообщения"}],
-            [{"text": "◀️ Назад"}],
+        "inline_keyboard": [
+            [{"text": f"{del_icon} Удалённые сообщения", "callback_data": f"settings:deleted:{int(not s['track_deleted'])}"}],
+            [{"text": f"{edit_icon} Изменённые сообщения", "callback_data": f"settings:edited:{int(not s['track_edited'])}"}],
         ],
-        "resize_keyboard": True,
-        "is_persistent": True,
-        "input_field_placeholder": "Настройки отслеживания",
     }
 
 
@@ -1530,6 +1550,14 @@ def handle_update(update: dict):
     if "message" in update:
         msg = update["message"]
         text = msg.get("text", "")
+        command_parts = text.split(maxsplit=1)
+        command = command_parts[0] if command_parts else ""
+        if "@" in command and command.startswith("/"):
+            name, username = command.split("@", 1)
+            if username.lower() != BOT_USERNAME.lower():
+                return
+            command = name
+            text = command + (" " + command_parts[1] if len(command_parts) > 1 else "")
         user = msg.get("from", {})
         chat_id = msg["chat"]["id"]
         user_id = user.get("id")
@@ -1724,7 +1752,12 @@ def handle_update(update: dict):
                 pass
             return
 
-        if s.get("support_mode") and user_id != ADMIN_ID:
+        is_menu_action = command in COMMAND_ACTIONS or command == "/start" or text in MENU_ACTION_TEXTS
+        if s.get("support_mode") and is_menu_action:
+            s["support_mode"] = False
+            db.save_user_settings(user_id, s["track_deleted"], s["track_edited"], False, s.get("support_active", False))
+
+        if s.get("support_mode") and user_id != ADMIN_ID and not text.startswith("/"):
             username = escape_html(user.get("username") or "", 100)
             first_name = escape_html(user.get("first_name") or "Без имени", 100)
             media_type, media_file_id = get_support_media(msg)
@@ -1773,6 +1806,8 @@ def handle_update(update: dict):
                     media_result = send_file(ADMIN_ID, media_file_id, media_type)
                     save_support_link_from_result(media_result, user_id)
                 return
+
+        text = COMMAND_ACTIONS.get(command, text)
 
         # Реферальная ссылка
         if text.startswith("/start ref_"):
@@ -2144,7 +2179,17 @@ def handle_update(update: dict):
 
         api("answerCallbackQuery", callback_query_id=cq["id"])
 
-        if data.startswith("users:ref:") and user_id == ADMIN_ID:
+        if data in ("settings:deleted:0", "settings:deleted:1", "settings:edited:0", "settings:edited:1"):
+            chat_id = cq["message"]["chat"]["id"]
+            if chat_id != user_id:
+                return
+            _, setting, value = data.split(":")
+            s = get_settings(user_id)
+            field = "track_deleted" if setting == "deleted" else "track_edited"
+            s[field] = value == "1"
+            db.save_user_settings(user_id, s["track_deleted"], s["track_edited"], s.get("support_mode", False), s.get("support_active", False))
+            api("editMessageReplyMarkup", chat_id=chat_id, message_id=cq["message"]["message_id"], reply_markup=settings_keyboard(user_id))
+        elif data.startswith("users:ref:") and user_id == ADMIN_ID:
             _, _, page_str, encoded_query = data.split(":", 3)
             page = int(page_str)
             query = urllib.parse.unquote(encoded_query) if encoded_query else ""
@@ -2505,6 +2550,7 @@ def main():
 
     me = api("getMe")
     BOT_USERNAME = me.get("result", {}).get("username", "DialogDelBot")
+    setup_command_menu()
 
     print("=" * 40)
     print(f"Бот @{BOT_USERNAME} запущен!")
