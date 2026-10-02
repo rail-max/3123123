@@ -1086,6 +1086,55 @@ def resolve_user_identifier(value: str):
     return found["user_id"] if found else None
 
 
+def payment_report_view(user_id=None, page=1):
+    report = db.get_payment_report(user_id=user_id, page=page)
+    title = "Все пользователи" if user_id is None else f"Пользователь {user_id}"
+    lines = [f"<b>Статистика оплат</b> · {title}", "За всё время\n"]
+    for currency, label in (("XTR", "Stars"), ("RUB", "₽ (Platega)")):
+        total = report["totals"].get(currency, {})
+        gross = total.get("gross", 0)
+        refunded = total.get("refunded", 0)
+        lines.append(
+            f"<b>{label}</b>\n"
+            f"Оплачено: {gross:,} · платежей: {total.get('paid_count', 0)}\n"
+            f"Возвращено: {refunded:,} · возвратов: {total.get('refund_count', 0)}\n"
+            f"После возвратов: {gross - refunded:,}\n"
+            f"Плательщиков: {total.get('payers', 0)}\n"
+        )
+    lines.append("<i>Суммы по базе, без вычета комиссий. Неоплаченные счета в итог не входят.</i>\n")
+    heading = "Последние операции" if report["page"] == 1 else "История операций"
+    lines.append(f"<b>{heading}</b> · {report['page']}/{report['pages']} · всего {report['total']}")
+    statuses = {"PAID": "Оплачено", "REFUNDED": "Возврат", "PENDING": "Ожидает оплаты",
+                "FAILED": "Ошибка", "CANCELED": "Отменено", "CANCELLED": "Отменено"}
+    for row in report["rows"]:
+        username = "@" + row["username"] if row.get("username") else str(row["user_id"])
+        name = escape_html(username, 45)
+        raw_date = row.get("event_at")
+        date = raw_date.strftime("%d.%m.%Y %H:%M") if raw_date else "—"
+        unit = "Stars" if row["currency"] == "XTR" else "₽"
+        status = escape_html(statuses.get(row["status"], row["status"]), 40)
+        lines.append(
+            f"\n<b>{row['amount']:,} {unit} · {status}</b>\n"
+            f"{name} · <code>{row['user_id']}</code> · {date}\n"
+            f"Тариф: {escape_html(row['plan'], 40)}\n"
+            f"ID: <code>{escape_html(row['transaction_id'], 120)}</code>"
+        )
+        if row.get("refunded_at"):
+            lines.append("Возвращено: " + row["refunded_at"].strftime("%d.%m.%Y %H:%M"))
+    if not report["rows"]:
+        lines.append("Платежей пока нет.")
+    target = str(user_id) if user_id is not None else "all"
+    nav = []
+    if report["page"] > 1:
+        nav.append({"text": "← Новее", "callback_data": f"payhist:{target}:{report['page'] - 1}"})
+    if report["page"] < report["pages"]:
+        nav.append({"text": "Ранее →", "callback_data": f"payhist:{target}:{report['page'] + 1}"})
+    keyboard = {"inline_keyboard": ([nav] if nav else []) + [[
+        {"text": "Последние / Обновить", "callback_data": f"payhist:{target}:1"},
+    ]]}
+    return "\n".join(lines), keyboard
+
+
 def filter_users(query: str | None):
     users = db.get_all_users()
     if not query:
@@ -1670,32 +1719,17 @@ def handle_update(update: dict):
             send(chat_id, out)
             return
 
-        if text.startswith("/payments ") and user_id == ADMIN_ID:
-            parts = text.split(maxsplit=1)
-            if len(parts) < 2:
-                send(chat_id, "❌ Формат: /payments user_id или /payments @username")
+        if command in ("/payments", "/paystats") and user_id == ADMIN_ID:
+            if chat_id != ADMIN_ID:
+                send(chat_id, "Открой статистику в личном чате с ботом.")
                 return
-            target_id = resolve_user_identifier(parts[1])
-            if not target_id:
+            parts = text.split(maxsplit=1)
+            target_id = resolve_user_identifier(parts[1]) if len(parts) > 1 else None
+            if len(parts) > 1 and not target_id:
                 send(chat_id, "❌ Пользователь не найден. Используй user_id или @username.")
                 return
-            payments = db.get_payments_by_user(target_id, limit=10)
-            if not payments:
-                send(chat_id, f"ℹ️ У пользователя {target_id} нет сохранённых платежей.")
-                return
-            out = f"💳 <b>Платежи пользователя {target_id}</b>\n\n"
-            for payment in payments:
-                created_at = payment.get("created_at")
-                created_text = created_at.strftime("%d.%m.%Y %H:%M") if created_at else "—"
-                refunded = "да" if payment.get("refunded") else "нет"
-                out += (
-                    f"• Тариф: {payment.get('invoice_payload')}\n"
-                    f"Сумма: {payment.get('total_amount')} {payment.get('currency')}\n"
-                    f"Возврат: {refunded}\n"
-                    f"Дата: {created_text}\n"
-                    f"Charge ID:\n<code>{payment.get('telegram_payment_charge_id')}</code>\n\n"
-                )
-            send(chat_id, out)
+            out, keyboard = payment_report_view(target_id)
+            send(chat_id, out, keyboard=keyboard)
             return
 
         if text.startswith("/refund ") and user_id == ADMIN_ID:
@@ -1997,11 +2031,13 @@ def handle_update(update: dict):
                 f"/cancelsub user_id|@user — то же самое\n"
                 f"/closesupport user_id|@user — закрыть диалог поддержки\n"
                 f"/supportlist — активные диалоги поддержки\n"
-                f"/payments user_id|@user — последние платежи пользователя\n"
+                f"/payments — статистика и история всех оплат\n"
+                f"/payments user_id|@user — история оплат пользователя\n"
                 f"/bd [текст] — рассылка всем пользователям (alias /broadcast)\n"
                 f"/bdsub [текст] — рассылка только активным подписчикам\n"
                 f"/bdconn [текст] — рассылка только подключённым\n"
-                f"/admin"
+                f"/admin",
+                keyboard={"inline_keyboard": [[{"text": "Статистика и история оплат", "callback_data": "payhist:all:1"}]]},
             )
 
         elif text.startswith("/sub ") and user_id == ADMIN_ID:
@@ -2145,6 +2181,12 @@ def handle_update(update: dict):
         cq = update["callback_query"]
         user_id = cq["from"]["id"]
         data = cq.get("data", "")
+        if data.startswith("payhist:") and user_id != ADMIN_ID:
+            api("answerCallbackQuery", callback_query_id=cq["id"], text="Только для администратора.", show_alert=True)
+            return
+        if data.startswith("payhist:") and cq.get("message", {}).get("chat", {}).get("id") != ADMIN_ID:
+            api("answerCallbackQuery", callback_query_id=cq["id"], text="Открой статистику в личном чате с ботом.", show_alert=True)
+            return
         if data == "check_required_channel":
             if not is_required_channel_member(user_id):
                 api(
@@ -2179,7 +2221,15 @@ def handle_update(update: dict):
 
         api("answerCallbackQuery", callback_query_id=cq["id"])
 
-        if data in ("settings:deleted:0", "settings:deleted:1", "settings:edited:0", "settings:edited:1"):
+        if data.startswith("payhist:") and user_id == ADMIN_ID:
+            parts = data.split(":")
+            if len(parts) != 3 or not parts[2].isdigit() or not (parts[1] == "all" or parts[1].isdigit()):
+                return
+            target_id = None if parts[1] == "all" else int(parts[1])
+            out, keyboard = payment_report_view(target_id, page=int(parts[2]))
+            api("editMessageText", chat_id=cq["message"]["chat"]["id"], message_id=cq["message"]["message_id"],
+                text=out, parse_mode="HTML", reply_markup=keyboard)
+        elif data in ("settings:deleted:0", "settings:deleted:1", "settings:edited:0", "settings:edited:1"):
             chat_id = cq["message"]["chat"]["id"]
             if chat_id != user_id:
                 return

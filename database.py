@@ -773,6 +773,59 @@ def get_payment(telegram_payment_charge_id: str):
     return dict(row) if row else None
 
 
+_PAYMENT_REPORT_SQL = """
+    SELECT 'stars' AS provider, telegram_payment_charge_id AS transaction_id,
+           user_id, invoice_payload AS plan, total_amount AS amount, currency,
+           CASE WHEN COALESCE(refunded, FALSE) THEN 'REFUNDED' ELSE 'PAID' END AS status,
+           created_at AS event_at, refunded_at
+    FROM payments WHERE currency = 'XTR'
+    UNION ALL
+    SELECT 'platega', transaction_id, user_id, plan_id, amount, currency,
+           CASE WHEN refunded OR status = 'CHARGEBACKED' THEN 'REFUNDED'
+                WHEN status = 'CONFIRMED' THEN 'PAID' ELSE status END,
+           COALESCE(confirmed_at, created_at), refunded_at
+    FROM platega_payments WHERE currency = 'RUB'
+"""
+
+
+def get_payment_report(user_id: int | None = None, page: int = 1, page_size: int = 6):
+    page_size = max(1, min(int(page_size), 10))
+    where = "WHERE user_id = %s" if user_id is not None else ""
+    params = (user_id,) if user_id is not None else ()
+    conn = get_conn()
+    try:
+        with conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as c:
+                c.execute(f"""
+                    WITH history AS ({_PAYMENT_REPORT_SQL})
+                    SELECT currency, COUNT(*) AS operations,
+                           SUM(CASE WHEN status IN ('PAID', 'REFUNDED') THEN 1 ELSE 0 END) AS paid_count,
+                           SUM(CASE WHEN status IN ('PAID', 'REFUNDED') THEN amount ELSE 0 END) AS gross,
+                           SUM(CASE WHEN status = 'REFUNDED' THEN 1 ELSE 0 END) AS refund_count,
+                           SUM(CASE WHEN status = 'REFUNDED' THEN amount ELSE 0 END) AS refunded,
+                           COUNT(DISTINCT CASE WHEN status IN ('PAID', 'REFUNDED') THEN user_id END) AS payers
+                    FROM history {where} GROUP BY currency
+                """, params)
+                totals = {row["currency"]: dict(row) for row in c.fetchall()}
+                total = sum(row["operations"] for row in totals.values())
+                pages = max(1, (total + page_size - 1) // page_size)
+                page = max(1, min(int(page), pages))
+                c.execute(f"""
+                    WITH history AS ({_PAYMENT_REPORT_SQL}), selected AS (
+                        SELECT * FROM history {where}
+                        ORDER BY event_at DESC NULLS LAST, provider, transaction_id
+                        LIMIT %s OFFSET %s
+                    )
+                    SELECT selected.*, users.username
+                    FROM selected LEFT JOIN users ON users.user_id = selected.user_id
+                    ORDER BY event_at DESC NULLS LAST, provider, transaction_id
+                """, params + (page_size, (page - 1) * page_size))
+                rows = [dict(row) for row in c.fetchall()]
+        return {"totals": totals, "rows": rows, "total": total, "page": page, "pages": pages}
+    finally:
+        release_conn(conn)
+
+
 def get_payments_by_user(user_id: int, limit: int = 10):
     conn = get_conn()
     c = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
