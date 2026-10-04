@@ -230,15 +230,18 @@ def submit_media_task(executor, slots, function, *args):
     return future
 
 
-def create_pending_locked_message(user_id: int, event_type: str, chat_link: str, reply_to_message: dict | None = None) -> str:
+def create_pending_locked_message(user_id: int, event_type: str, chat_link: str, reply_to_message: dict | None = None, saved_text: str | None = None) -> str:
     token = uuid.uuid4().hex
-    _PENDING_LOCKED_MESSAGES[token] = {
+    pending = {
         "user_id": user_id,
         "event_type": event_type,
         "chat_link": chat_link,
         "reply_to_message": reply_to_message,
+        "saved_text": saved_text,
         "created_at": int(time.time()),
     }
+    db.save_locked_message(token, user_id, pending)
+    _PENDING_LOCKED_MESSAGES[token] = pending
     if len(_PENDING_LOCKED_MESSAGES) > 5000:
         cutoff = int(time.time()) - 24 * 60 * 60
         stale_tokens = [
@@ -249,6 +252,68 @@ def create_pending_locked_message(user_id: int, event_type: str, chat_link: str,
         for pending_token in stale_tokens:
             _PENDING_LOCKED_MESSAGES.pop(pending_token, None)
     return token
+
+
+def get_pending_locked_message(token, user_id):
+    pending = _PENDING_LOCKED_MESSAGES.get(token)
+    if pending is None:
+        pending = db.get_locked_message(token, user_id)
+    if not isinstance(pending, dict) or pending.get("user_id") != user_id:
+        return None
+    if pending.get("created_at", 0) < time.time() - 14 * 24 * 60 * 60:
+        _PENDING_LOCKED_MESSAGES.pop(token, None)
+        return None
+    return pending
+
+
+def deliver_locked_message(token, user_id, message_id):
+    pending = get_pending_locked_message(token, user_id)
+    if not pending or not db.is_sub_active(user_id):
+        return False
+    if not db.claim_locked_message(token, user_id):
+        return False
+    is_text = bool(pending.get("saved_text"))
+    result = {"ok": False}
+    try:
+        if is_text:
+            result = api("editMessageText", chat_id=user_id, message_id=message_id,
+                         text=pending["saved_text"], parse_mode="HTML", reply_markup={"inline_keyboard": []})
+            if result.get("error_code") == 400 and "message is not modified" in result.get("description", "").lower():
+                result = {"ok": True}
+        elif pending.get("reply_to_message"):
+            reply = pending["reply_to_message"]
+            event_type = pending.get("event_type", "deleted")
+            caption = (reply_media_notice_caption(pending.get("chat_link", "чатом"), reply.get("date"))
+                       if event_type == "reply_media" else
+                       f"🗑️ <b>В чате с {pending.get('chat_link', 'чатом')} удалено сообщение</b>")
+            result = send_reply_media(user_id, reply, caption, prefer_upload=event_type == "reply_media")
+            if result.get("ok"):
+                api("editMessageText", chat_id=user_id, message_id=message_id,
+                    text="✅ Сообщение отправлено выше.", reply_markup={"inline_keyboard": []})
+        return bool(result.get("ok"))
+    except Exception:
+        result = {"ok": False, "delivery_uncertain": True}
+        raise
+    finally:
+        if result.get("ok"):
+            db.finish_locked_message(token, user_id, delivered=True)
+            _PENDING_LOCKED_MESSAGES.pop(token, None)
+        elif is_text or not result.get("delivery_uncertain"):
+            # Editing the original notification is idempotent; media sends are not.
+            db.finish_locked_message(token, user_id, delivered=False)
+
+
+def deliver_requested_locked_messages(user_id):
+    try:
+        if not db.is_sub_active(user_id):
+            return
+        for token, message_id in db.get_requested_locked_messages(user_id):
+            try:
+                deliver_locked_message(token, user_id, message_id)
+            except Exception as exc:
+                logging.error("Locked message delivery failed: %s", type(exc).__name__)
+    except Exception as exc:
+        logging.error("Requested messages lookup failed: %s", type(exc).__name__)
 
 
 def format_ts_msk(unix_ts: int) -> str:
@@ -414,6 +479,7 @@ class HealthHandler(BaseHTTPRequestHandler):
                 if payment:
                     user_id, days = payment
                     send(user_id, f"✅ <b>Оплата через Platega прошла!</b>\nПодписка на <b>{days} дней</b> активирована.", keyboard=main_keyboard())
+                    deliver_requested_locked_messages(user_id)
                 else:
                     logging.warning(
                         "Platega confirmation was not granted: transaction_id=%s amount=%s currency=%s",
@@ -1382,22 +1448,24 @@ def create_platega_payment(user_id: int) -> tuple[str | None, str | None]:
         return None, "Не удалось создать счёт. Попробуй ещё раз через минуту или напиши в поддержку."
 
 
-def expired_details_text(user_id: int, event_type: str = "deleted") -> str:
-    ref_link = get_ref_link(user_id)
+def expired_details_text(user_id: int, event_type: str = "deleted", chat_link: str | None = None) -> str:
     ref_count = db.get_referral_count(user_id)
     if event_type == "edited":
+        title = f"В чате с {chat_link} изменено сообщение" if chat_link else "Сообщение изменено"
         event_text = (
-            "✏️ <b>Сообщение изменено</b>\n\n"
+            f"✏️ <b>{title}</b>\n\n"
             "Чтобы видеть содержимое изменённых сообщений, продлите подписку.\n\n"
         )
     elif event_type == "reply_media":
+        title = f"Медиа из ответа в чате с {chat_link}" if chat_link else "Медиа из ответа"
         event_text = (
-            "📸 <b>Медиа из ответа</b>\n\n"
+            f"📸 <b>{title}</b>\n\n"
             "Чтобы получить это медиа, продлите подписку.\n\n"
         )
     else:
+        title = f"В чате с {chat_link} удалено сообщение" if chat_link else "Сообщение удалено"
         event_text = (
-            "🗑️ <b>Сообщение удалено</b>\n\n"
+            f"🗑️ <b>{title}</b>\n\n"
             "Чтобы увидеть содержимое удалённого сообщения, продлите подписку.\n\n"
         )
 
@@ -1429,10 +1497,14 @@ def send_expired_message(
     chat_link: str,
     locked: bool = False,
     reply_to_message: dict | None = None,
+    saved_text: str | None = None,
 ):
-    if locked and event_type in ("deleted", "reply_media"):
-        token = create_pending_locked_message(user_id, event_type, chat_link, reply_to_message)
-        if event_type == "reply_media":
+    if locked and event_type in ("deleted", "reply_media", "edited"):
+        token = create_pending_locked_message(user_id, event_type, chat_link, reply_to_message, saved_text)
+        if event_type == "edited":
+            title = f"✏️ <b>В чате с {chat_link} изменено сообщение</b>"
+            description = "Чтобы увидеть изменения, нажмите кнопку ниже."
+        elif event_type == "reply_media":
             title = f"📸 <b>Медиа из ответа в чате с {chat_link}</b>"
             description = "Чтобы получить это медиа, продлите подписку."
         else:
@@ -1444,18 +1516,7 @@ def send_expired_message(
             keyboard={"inline_keyboard": [[{"text": "Показать сообщение", "callback_data": f"show_locked:{token}"}]]},
         )
 
-    if event_type == "edited":
-        text = (
-            f"✏️ <b>В чате с {chat_link} изменено сообщение</b>\n\n"
-            "Чтобы видеть содержимое изменённых сообщений, продлите подписку.\n\n"
-            + expired_details_text(user_id, event_type)
-        )
-    else:
-        text = (
-            f"🗑️ <b>В чате с {chat_link} удалено сообщение</b>\n\n"
-            "Чтобы видеть содержимое удалённых сообщений, продлите подписку.\n\n"
-            + expired_details_text(user_id, event_type)
-        )
+    text = expired_details_text(user_id, event_type, chat_link=chat_link)
     return send(user_id, text, keyboard=expired_payment_keyboard(user_id))
 
 
@@ -1593,6 +1654,7 @@ def handle_update(update: dict):
             f"✅ <b>Оплата прошла!</b>\nПодписка на <b>{plan['days']} дней</b> активирована.",
             keyboard=main_keyboard(),
         )
+        deliver_requested_locked_messages(user_id)
         return
 
     # ── Обычное сообщение боту ─────────────────────────────
@@ -2273,62 +2335,25 @@ def handle_update(update: dict):
             )
         elif data.startswith("show_locked:"):
             token = data.split(":", 1)[1]
-            pending = _PENDING_LOCKED_MESSAGES.get(token)
-            if not pending or pending.get("user_id") != user_id:
-                api(
-                    "editMessageText",
-                    chat_id=cq["message"]["chat"]["id"],
-                    message_id=cq["message"]["message_id"],
-                    text=expired_details_text(user_id, "deleted"),
-                    parse_mode="HTML",
-                    reply_markup=expired_payment_keyboard(user_id),
-                )
+            if cq["message"]["chat"]["id"] != user_id:
+                return
+            pending = get_pending_locked_message(token, user_id)
+            if not pending:
+                send(user_id, "Это сообщение уже недоступно или принадлежит другому пользователю.")
                 return
 
+            db.request_locked_message(token, user_id, cq["message"]["message_id"])
             if not db.is_sub_active(user_id):
-                api(
-                    "editMessageText",
-                    chat_id=cq["message"]["chat"]["id"],
-                    message_id=cq["message"]["message_id"],
-                    text=expired_details_text(user_id, pending.get("event_type", "deleted")),
-                    parse_mode="HTML",
-                    reply_markup=expired_payment_keyboard(user_id),
-                )
-                return
-
-            reply_to_message = pending.get("reply_to_message")
-            if reply_to_message:
-                event_type = pending.get("event_type", "deleted")
-                if event_type == "reply_media":
-                    caption = reply_media_notice_caption(pending.get("chat_link", "чатом"), reply_to_message.get("date"))
-                else:
-                    caption = f"🗑️ <b>В чате с {pending.get('chat_link', 'чатом')} удалено сообщение</b>"
-                result = send_reply_media(
+                send(
                     user_id,
-                    reply_to_message,
-                    caption,
-                    prefer_upload=event_type == "reply_media",
+                    expired_details_text(user_id, pending.get("event_type", "deleted"))
+                    + "\n\nПосле оплаты запрошенное сообщение откроется автоматически. Срок хранения: 14 дней.",
+                    keyboard=expired_payment_keyboard(user_id),
                 )
-                if result.get("ok"):
-                    _PENDING_LOCKED_MESSAGES.pop(token, None)
-                    api(
-                        "editMessageText",
-                        chat_id=cq["message"]["chat"]["id"],
-                        message_id=cq["message"]["message_id"],
-                        text="✅ Сообщение отправлено выше.",
-                        parse_mode="HTML",
-                    )
-                else:
-                    send(user_id, "❌ Не удалось получить это сообщение. Telegram мог уже закрыть доступ к файлу.")
                 return
 
-            api(
-                "editMessageText",
-                chat_id=cq["message"]["chat"]["id"],
-                message_id=cq["message"]["message_id"],
-                text="❌ Это сообщение уже недоступно. Попробуйте ответить на него ещё раз.",
-                parse_mode="HTML",
-            )
+            if not deliver_locked_message(token, user_id, cq["message"]["message_id"]):
+                send(user_id, "Не удалось подтвердить показ сообщения. Для медиа Telegram мог уже закрыть доступ к файлу.")
         elif data == "buy_platega_monthly":
             payment_url, error_message = create_platega_payment(user_id)
             if not payment_url:
@@ -2508,19 +2533,20 @@ def handle_update(update: dict):
 
         original = db.get_cached_message(conn_id, msg["chat"]["id"], msg["message_id"])
         if original and original["text"] != new_text:
-            if not db.is_sub_active(owner_id):
-                result = send_expired_message(owner_id, "edited", get_chat_link(msg["chat"]))
-                if result.get("ok"):
-                    db.update_cached_text(conn_id, msg["chat"]["id"], msg["message_id"], new_text)
-                return
-
-            result = send(owner_id,
+            edit_text = (
                 f"✏️ <b>Сообщение изменено</b>\n"
                 f"👤 {get_chat_link(msg['chat'])}\n"
                 f"🕐 {original['date']}\n\n"
                 f"<b>Было:</b>\n{escape_html(original['text'], 1500)}\n\n"
                 f"<b>Стало:</b>\n{escape_html(new_text, 1500)}"
             )
+            if not db.is_sub_active(owner_id):
+                result = send_expired_message(owner_id, "edited", get_chat_link(msg["chat"]), locked=True, saved_text=edit_text)
+                if result.get("ok"):
+                    db.update_cached_text(conn_id, msg["chat"]["id"], msg["message_id"], new_text)
+                return
+
+            result = send(owner_id, edit_text)
             if result.get("ok"):
                 db.update_cached_text(conn_id, msg["chat"]["id"], msg["message_id"], new_text)
 
@@ -2555,7 +2581,23 @@ def handle_update(update: dict):
             return
 
         if not db.is_sub_active(owner_id):
-            send_expired_message(owner_id, "deleted", chat_link, locked=True)
+            for item_type, msg_id, cached_item in deleted_items:
+                if item_type == "message":
+                    saved_text = (
+                        f"🗑️ <b>В чате с {chat_link} удалено сообщение</b>\n"
+                        f"🕐 {cached_item['date']}\n\n"
+                        f"<b>Текст:</b>\n{escape_html(cached_item['text'], 3400)}"
+                    )
+                    result = send_expired_message(owner_id, "deleted", chat_link, locked=True, saved_text=saved_text)
+                    if result.get("ok"):
+                        db.delete_cached_message(conn_id, chat_id, msg_id)
+                else:
+                    media_type = cached_item["file_type"]
+                    media = {"file_id": cached_item["file_id"]}
+                    reply = {media_type: [media] if media_type == "photo" else media}
+                    result = send_expired_message(owner_id, "deleted", chat_link, locked=True, reply_to_message=reply)
+                    if result.get("ok"):
+                        db.delete_cached_media(conn_id, chat_id, msg_id)
             return
 
         for item_type, msg_id, cached_item in deleted_items:

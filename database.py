@@ -4,6 +4,7 @@ import base64
 import hashlib
 import logging
 import os
+import json
 import psycopg2
 import psycopg2.extras
 from psycopg2.pool import ThreadedConnectionPool
@@ -191,6 +192,18 @@ def init_db():
         )
     """)
 
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS locked_messages (
+            token TEXT PRIMARY KEY,
+            user_id BIGINT NOT NULL,
+            payload TEXT NOT NULL,
+            requested_message_id BIGINT,
+            claimed BOOLEAN NOT NULL DEFAULT FALSE,
+            created_at TIMESTAMP NOT NULL DEFAULT NOW()
+        )
+    """)
+    c.execute("CREATE INDEX IF NOT EXISTS idx_locked_messages_user ON locked_messages (user_id)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_locked_messages_created ON locked_messages (created_at)")
     c.execute("""
         CREATE TABLE IF NOT EXISTS support_message_links (
             admin_message_id    BIGINT PRIMARY KEY,
@@ -583,6 +596,7 @@ def resume_subscription(user_id: int):
 def cleanup_temp_tables():
     conn = get_conn()
     c = conn.cursor()
+    c.execute("DELETE FROM locked_messages WHERE created_at < NOW() - INTERVAL '14 days'")
     c.execute("""
         DELETE FROM message_cache
         WHERE created_at < NOW() - INTERVAL '14 days'
@@ -757,6 +771,88 @@ def apply_stars_purchase(
     except Exception:
         conn.rollback()
         raise
+    finally:
+        release_conn(conn)
+
+
+def save_locked_message(token: str, user_id: int, payload: dict):
+    encrypted = encrypt_value(json.dumps(payload, ensure_ascii=False))
+    conn = get_conn()
+    try:
+        with conn:
+            with conn.cursor() as c:
+                c.execute("INSERT INTO locked_messages (token, user_id, payload) VALUES (%s, %s, %s)",
+                          (token, user_id, encrypted))
+    finally:
+        release_conn(conn)
+
+
+def get_locked_message(token: str, user_id: int):
+    conn = get_conn()
+    try:
+        with conn:
+            with conn.cursor() as c:
+                c.execute("""
+                    SELECT payload FROM locked_messages WHERE token = %s AND user_id = %s
+                      AND created_at >= NOW() - INTERVAL '14 days'
+                """, (token, user_id))
+                row = c.fetchone()
+        return json.loads(decrypt_value(row[0])) if row else None
+    finally:
+        release_conn(conn)
+
+
+def request_locked_message(token: str, user_id: int, message_id: int):
+    conn = get_conn()
+    try:
+        with conn:
+            with conn.cursor() as c:
+                c.execute("UPDATE locked_messages SET requested_message_id = %s WHERE token = %s AND user_id = %s",
+                          (message_id, token, user_id))
+    finally:
+        release_conn(conn)
+
+
+def get_requested_locked_messages(user_id: int):
+    conn = get_conn()
+    try:
+        with conn:
+            with conn.cursor() as c:
+                c.execute("""
+                    SELECT token, requested_message_id FROM locked_messages
+                    WHERE user_id = %s AND requested_message_id IS NOT NULL AND claimed = FALSE
+                      AND created_at >= NOW() - INTERVAL '14 days'
+                    ORDER BY created_at
+                """, (user_id,))
+                return c.fetchall()
+    finally:
+        release_conn(conn)
+
+
+def claim_locked_message(token: str, user_id: int) -> bool:
+    conn = get_conn()
+    try:
+        with conn:
+            with conn.cursor() as c:
+                c.execute("""
+                    UPDATE locked_messages SET claimed = TRUE
+                    WHERE token = %s AND user_id = %s AND claimed = FALSE
+                      AND created_at >= NOW() - INTERVAL '14 days'
+                    RETURNING token
+                """, (token, user_id))
+                return c.fetchone() is not None
+    finally:
+        release_conn(conn)
+
+
+def finish_locked_message(token: str, user_id: int, delivered: bool):
+    conn = get_conn()
+    try:
+        with conn:
+            with conn.cursor() as c:
+                query = ("DELETE FROM locked_messages WHERE token = %s AND user_id = %s" if delivered else
+                         "UPDATE locked_messages SET claimed = FALSE WHERE token = %s AND user_id = %s")
+                c.execute(query, (token, user_id))
     finally:
         release_conn(conn)
 
