@@ -1203,10 +1203,12 @@ def payment_report_view(user_id=None, page=1):
 
 ADS_HELP = (
     "Создать размещение (цена в рублях):\n"
-    "<code>/ads new Название канала | 1500</code>\n"
+    "<code>/ads new Название канала 1500</code>\n"
+    "Цена — последнее число. Вариант с | тоже работает.\n"
     "Для бесплатного размещения укажи 0.\n"
     "Изменить расходы: <code>/ads cost ID 2000</code>\n"
-    "Отчёт: <code>/ads ID</code>"
+    "Отчёт: <code>/ads ID</code>\n"
+    "Удалить из списка: <code>/ads delete ID</code> (с подтверждением)"
 )
 
 
@@ -1251,7 +1253,7 @@ def ad_report_view(campaign_id):
     link = f"https://t.me/{BOT_USERNAME}?start=ad_{report['code']}"
     lines = [
         f"<b>#{report['id']} · {escape_html(report['name'])}</b>",
-        f"Ссылка для рекламы:\n{link}",
+        "<b>В архиве.</b> Новые заходы по ссылке не учитываются." if report.get("archived_at") else f"Ссылка для рекламы:\n{link}",
         f"Расходы: <b>{cost:,.2f} ₽</b>",
         f"Уникальных запусков: <b>{report['visitors']}</b>\n"
         f"Новых пользователей: <b>{new_users}</b>\n"
@@ -1274,8 +1276,30 @@ def ad_report_view(campaign_id):
         "Новые пользователи закреплены за первым источником; подключения и оплаты только от них, за всё время. "
         "Плательщики включают возвраты. Суммы без комиссий; Stars не складываются с рублями.</i>"
     )
-    return "\n\n".join(lines), {"inline_keyboard": [[
+    buttons = [[
         {"text": "Обновить", "callback_data": f"ads:view:{campaign_id}"}, back,
+    ]]
+    if not report.get("archived_at"):
+        buttons.append([{"text": "Удалить из списка", "callback_data": f"ads:delete:{campaign_id}"}])
+    return "\n\n".join(lines), {"inline_keyboard": buttons}
+
+
+def ad_delete_view(campaign_id):
+    report = db.get_ad_report(campaign_id)
+    back = {"text": "Все размещения", "callback_data": "ads:list:1"}
+    if not report:
+        return "Размещение не найдено.", {"inline_keyboard": [[back]]}
+    if report.get("archived_at"):
+        return "Размещение уже в архиве.", {"inline_keyboard": [[back]]}
+    text = (
+        f"Удалить из списка <b>#{campaign_id} · {escape_html(report['name'])}</b>?\n\n"
+        "Размещение уйдёт в архив. Ссылка по-прежнему откроет бота, но новые заходы учитываться не будут.\n"
+        "Пользователи, подписки и история оплат сохранятся. "
+        f"Архивный отчёт доступен через <code>/ads {campaign_id}</code>."
+    )
+    return text, {"inline_keyboard": [[
+        {"text": "Подтвердить удаление", "callback_data": f"ads:archive:{campaign_id}"},
+        {"text": "Отмена", "callback_data": f"ads:view:{campaign_id}"},
     ]]}
 
 
@@ -1285,10 +1309,12 @@ def ads_command_view(text):
         return ads_list_view()
     if len(parts) == 2 and parts[1].isdigit() and len(parts[1]) <= 10:
         return ad_report_view(int(parts[1]))
+    if len(parts) == 3 and parts[1] == "delete" and parts[2].isdigit() and len(parts[2]) <= 10:
+        return ad_delete_view(int(parts[2]))
     if len(parts) == 3 and parts[1] == "new":
-        fields = parts[2].rsplit("|", 1)
+        fields = parts[2].rsplit("|", 1) if "|" in parts[2] else parts[2].rsplit(None, 1)
         if len(fields) != 2:
-            raise ValueError(ADS_HELP)
+            raise ValueError("Укажи название и цену в конце, например:\n<code>/ads new Пример 500</code>")
         name = " ".join(fields[0].split())
         if not 1 <= len(name) <= 100:
             raise ValueError("Название должно содержать от 1 до 100 символов.")
@@ -2413,10 +2439,18 @@ def handle_update(update: dict):
 
         if data.startswith("ads:") and user_id == ADMIN_ID:
             parts = data.split(":")
-            if len(parts) != 3 or parts[1] not in ("list", "view") or not parts[2].isdigit() or len(parts[2]) > 10:
+            if len(parts) != 3 or parts[1] not in ("list", "view", "delete", "archive") or not parts[2].isdigit() or len(parts[2]) > 10:
                 return
             value = int(parts[2])
-            out, keyboard = ads_list_view(value) if parts[1] == "list" else ad_report_view(value)
+            if parts[1] == "delete":
+                out, keyboard = ad_delete_view(value)
+            elif parts[1] == "archive":
+                archived = db.archive_ad_campaign(value)
+                out, keyboard = ads_list_view()
+                notice = "Размещение убрано в архив." if archived else "Размещение уже в архиве или не найдено."
+                out = notice + "\n\n" + out
+            else:
+                out, keyboard = ads_list_view(value) if parts[1] == "list" else ad_report_view(value)
             api("editMessageText", chat_id=cq["message"]["chat"]["id"], message_id=cq["message"]["message_id"],
                 text=out, parse_mode="HTML", reply_markup=keyboard)
         elif data.startswith("payhist:") and user_id == ADMIN_ID:

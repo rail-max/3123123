@@ -209,9 +209,11 @@ def init_db():
             code TEXT UNIQUE NOT NULL,
             name TEXT NOT NULL,
             cost_rub NUMERIC(12, 2) NOT NULL CHECK (cost_rub >= 0),
+            archived_at TIMESTAMP,
             created_at TIMESTAMP NOT NULL DEFAULT NOW()
         )
     """)
+    c.execute("ALTER TABLE ad_campaigns ADD COLUMN IF NOT EXISTS archived_at TIMESTAMP")
     c.execute("""
         CREATE TABLE IF NOT EXISTS ad_visits (
             campaign_id INTEGER NOT NULL REFERENCES ad_campaigns(id),
@@ -975,13 +977,27 @@ def set_ad_campaign_cost(campaign_id, cost_rub):
         release_conn(conn)
 
 
+def archive_ad_campaign(campaign_id):
+    conn = get_conn()
+    try:
+        with conn:
+            with conn.cursor() as c:
+                c.execute("""
+                    UPDATE ad_campaigns SET archived_at = CURRENT_TIMESTAMP
+                    WHERE id = %s AND archived_at IS NULL RETURNING id
+                """, (campaign_id,))
+                return c.fetchone() is not None
+    finally:
+        release_conn(conn)
+
+
 def record_ad_start(code, user_id, username, first_name):
     """Claim the first source only when this transaction creates the user."""
     conn = get_conn()
     try:
         with conn:
             with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as c:
-                c.execute("SELECT id FROM ad_campaigns WHERE code = %s", (code,))
+                c.execute("SELECT id FROM ad_campaigns WHERE code = %s AND archived_at IS NULL", (code,))
                 campaign = c.fetchone()
                 if not campaign:
                     return
@@ -1010,7 +1026,7 @@ def list_ad_campaigns(page=1, page_size=6):
     try:
         with conn:
             with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as c:
-                c.execute("SELECT COUNT(*) AS total FROM ad_campaigns", ())
+                c.execute("SELECT COUNT(*) AS total FROM ad_campaigns WHERE archived_at IS NULL", ())
                 total = c.fetchone()["total"]
                 pages = max(1, (total + page_size - 1) // page_size)
                 page = max(1, min(int(page), pages))
@@ -1018,7 +1034,7 @@ def list_ad_campaigns(page=1, page_size=6):
                     SELECT a.*,
                         (SELECT COUNT(*) FROM ad_visits v WHERE v.campaign_id = a.id) AS visitors,
                         (SELECT COUNT(*) FROM ad_acquisitions n WHERE n.campaign_id = a.id) AS new_users
-                    FROM ad_campaigns a ORDER BY a.id DESC LIMIT %s OFFSET %s
+                    FROM ad_campaigns a WHERE a.archived_at IS NULL ORDER BY a.id DESC LIMIT %s OFFSET %s
                 """, (page_size, (page - 1) * page_size))
                 return {"rows": [dict(row) for row in c.fetchall()], "page": page, "pages": pages}
     finally:
