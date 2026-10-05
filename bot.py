@@ -1201,6 +1201,111 @@ def payment_report_view(user_id=None, page=1):
     return "\n".join(lines), keyboard
 
 
+ADS_HELP = (
+    "Создать размещение (цена в рублях):\n"
+    "<code>/ads new Название канала | 1500</code>\n"
+    "Для бесплатного размещения укажи 0.\n"
+    "Изменить расходы: <code>/ads cost ID 2000</code>\n"
+    "Отчёт: <code>/ads ID</code>"
+)
+
+
+def parse_ad_cost(value):
+    value = value.strip().replace(",", ".")
+    if not re.fullmatch(r"[0-9]{1,10}(?:\.[0-9]{1,2})?", value):
+        raise ValueError("Цена должна быть от 0 до 9999999999.99 руб., максимум две цифры после точки.")
+    return Decimal(value)
+
+
+def ads_list_view(page=1):
+    report = db.list_ad_campaigns(page=page)
+    lines = ["<b>Рекламные размещения</b>", ADS_HELP, ""]
+    buttons = []
+    for row in report["rows"]:
+        lines.append(
+            f"<b>#{row['id']} · {escape_html(row['name'])}</b>\n"
+            f"Расходы: {row['cost_rub']:,.2f} ₽ · запусков: {row['visitors']} · новых: {row['new_users']}"
+        )
+        buttons.append([{"text": f"#{row['id']} · {row['name'][:45]}", "callback_data": f"ads:view:{row['id']}"}])
+    if not report["rows"]:
+        lines.append("Размещений пока нет.")
+    lines.append(f"\nСтраница {report['page']}/{report['pages']}")
+    nav = []
+    if report["page"] > 1:
+        nav.append({"text": "Назад", "callback_data": f"ads:list:{report['page'] - 1}"})
+    if report["page"] < report["pages"]:
+        nav.append({"text": "Далее", "callback_data": f"ads:list:{report['page'] + 1}"})
+    if nav:
+        buttons.append(nav)
+    buttons.append([{"text": "Обновить", "callback_data": f"ads:list:{report['page']}"}])
+    return "\n\n".join(lines), {"inline_keyboard": buttons}
+
+
+def ad_report_view(campaign_id):
+    report = db.get_ad_report(campaign_id)
+    back = {"text": "Все размещения", "callback_data": "ads:list:1"}
+    if not report:
+        return "Размещение не найдено.", {"inline_keyboard": [[back]]}
+    new_users, payers = report["new_users"], report["payers"]
+    cost = Decimal(str(report["cost_rub"]))
+    link = f"https://t.me/{BOT_USERNAME}?start=ad_{report['code']}"
+    lines = [
+        f"<b>#{report['id']} · {escape_html(report['name'])}</b>",
+        f"Ссылка для рекламы:\n{link}",
+        f"Расходы: <b>{cost:,.2f} ₽</b>",
+        f"Уникальных запусков: <b>{report['visitors']}</b>\n"
+        f"Новых пользователей: <b>{new_users}</b>\n"
+        f"Уже были в боте: {report['visitors'] - new_users}",
+        f"Из новых:\nПодключили бота: <b>{report['connected']}</b>\n"
+        f"Подключены сейчас: {report['active_connections']}\n"
+        f"Оплатили хотя бы раз: <b>{payers}</b>",
+    ]
+    if new_users:
+        lines.append(f"Конверсия в оплату: {payers / new_users:.1%}\nЦена нового пользователя: {cost / new_users:,.2f} ₽")
+    if payers:
+        lines.append(f"Цена плательщика: {cost / payers:,.2f} ₽")
+    for currency, label in (("XTR", "Stars"), ("RUB", "₽")):
+        total = report["totals"].get(currency, {})
+        gross, refunded = total.get("gross", 0), total.get("refunded", 0)
+        lines.append(f"<b>Оплаты · {label}</b>\nПлатежей: {total.get('paid_count', 0)}\n"
+                     f"Получено: {gross:,}\nВозвращено: {refunded:,}\nПосле возвратов: {gross - refunded:,}")
+    lines.append(
+        "<i>Считаются запуски через ссылку, не клики. Повторы не добавляют людей. "
+        "Новые пользователи закреплены за первым источником; подключения и оплаты только от них, за всё время. "
+        "Плательщики включают возвраты. Суммы без комиссий; Stars не складываются с рублями.</i>"
+    )
+    return "\n\n".join(lines), {"inline_keyboard": [[
+        {"text": "Обновить", "callback_data": f"ads:view:{campaign_id}"}, back,
+    ]]}
+
+
+def ads_command_view(text):
+    parts = text.split(maxsplit=2)
+    if len(parts) == 1:
+        return ads_list_view()
+    if len(parts) == 2 and parts[1].isdigit() and len(parts[1]) <= 10:
+        return ad_report_view(int(parts[1]))
+    if len(parts) == 3 and parts[1] == "new":
+        fields = parts[2].rsplit("|", 1)
+        if len(fields) != 2:
+            raise ValueError(ADS_HELP)
+        name = " ".join(fields[0].split())
+        if not 1 <= len(name) <= 100:
+            raise ValueError("Название должно содержать от 1 до 100 символов.")
+        cost = parse_ad_cost(fields[1])
+        campaign_id = db.create_ad_campaign(name, uuid.uuid4().hex[:16], cost)
+        return ad_report_view(campaign_id)
+    if len(parts) == 3 and parts[1] == "cost":
+        fields = parts[2].split()
+        if len(fields) != 2 or not fields[0].isdigit() or len(fields[0]) > 10:
+            raise ValueError(ADS_HELP)
+        campaign_id = int(fields[0])
+        if not db.set_ad_campaign_cost(campaign_id, parse_ad_cost(fields[1])):
+            raise ValueError("Размещение не найдено.")
+        return ad_report_view(campaign_id)
+    raise ValueError(ADS_HELP)
+
+
 def filter_users(query: str | None):
     users = db.get_all_users()
     if not query:
@@ -1676,6 +1781,10 @@ def handle_update(update: dict):
             logging.warning("Message without sender user_id ignored")
             return
 
+        if command == "/start" and chat_id == user_id and user_id != ADMIN_ID:
+            payload = text.split(maxsplit=1)
+            if len(payload) == 2 and re.fullmatch(r"ad_[a-zA-Z0-9_-]{1,61}", payload[1]):
+                db.record_ad_start(payload[1][3:], user_id, user.get("username", ""), user.get("first_name", ""))
         db.save_user(user_id, user.get("username", ""), user.get("first_name", ""))
         s = get_settings(user_id)
 
@@ -1779,6 +1888,21 @@ def handle_update(update: dict):
                     f"Закрыть: <code>/closesupport {support_user_id}</code>\n\n"
                 )
             send(chat_id, out)
+            return
+
+        if command == "/ads":
+            if user_id != ADMIN_ID:
+                send(chat_id, "Только для администратора.")
+                return
+            if chat_id != ADMIN_ID:
+                send(chat_id, "Открой статистику в личном чате с ботом.")
+                return
+            try:
+                out, keyboard = ads_command_view(text)
+            except ValueError as exc:
+                send(chat_id, str(exc))
+                return
+            send(chat_id, out, keyboard=keyboard)
             return
 
         if command in ("/payments", "/paystats") and user_id == ADMIN_ID:
@@ -2095,11 +2219,15 @@ def handle_update(update: dict):
                 f"/supportlist — активные диалоги поддержки\n"
                 f"/payments — статистика и история всех оплат\n"
                 f"/payments user_id|@user — история оплат пользователя\n"
+                f"/ads — рекламные ссылки и статистика\n"
                 f"/bd [текст] — рассылка всем пользователям (alias /broadcast)\n"
                 f"/bdsub [текст] — рассылка только активным подписчикам\n"
                 f"/bdconn [текст] — рассылка только подключённым\n"
                 f"/admin",
-                keyboard={"inline_keyboard": [[{"text": "Статистика и история оплат", "callback_data": "payhist:all:1"}]]},
+                keyboard={"inline_keyboard": [
+                    [{"text": "Статистика и история оплат", "callback_data": "payhist:all:1"}],
+                    [{"text": "Реклама и источники", "callback_data": "ads:list:1"}],
+                ]},
             )
 
         elif text.startswith("/sub ") and user_id == ADMIN_ID:
@@ -2243,10 +2371,10 @@ def handle_update(update: dict):
         cq = update["callback_query"]
         user_id = cq["from"]["id"]
         data = cq.get("data", "")
-        if data.startswith("payhist:") and user_id != ADMIN_ID:
+        if data.startswith(("payhist:", "ads:")) and user_id != ADMIN_ID:
             api("answerCallbackQuery", callback_query_id=cq["id"], text="Только для администратора.", show_alert=True)
             return
-        if data.startswith("payhist:") and cq.get("message", {}).get("chat", {}).get("id") != ADMIN_ID:
+        if data.startswith(("payhist:", "ads:")) and cq.get("message", {}).get("chat", {}).get("id") != ADMIN_ID:
             api("answerCallbackQuery", callback_query_id=cq["id"], text="Открой статистику в личном чате с ботом.", show_alert=True)
             return
         if data == "check_required_channel":
@@ -2283,7 +2411,15 @@ def handle_update(update: dict):
 
         api("answerCallbackQuery", callback_query_id=cq["id"])
 
-        if data.startswith("payhist:") and user_id == ADMIN_ID:
+        if data.startswith("ads:") and user_id == ADMIN_ID:
+            parts = data.split(":")
+            if len(parts) != 3 or parts[1] not in ("list", "view") or not parts[2].isdigit() or len(parts[2]) > 10:
+                return
+            value = int(parts[2])
+            out, keyboard = ads_list_view(value) if parts[1] == "list" else ad_report_view(value)
+            api("editMessageText", chat_id=cq["message"]["chat"]["id"], message_id=cq["message"]["message_id"],
+                text=out, parse_mode="HTML", reply_markup=keyboard)
+        elif data.startswith("payhist:") and user_id == ADMIN_ID:
             parts = data.split(":")
             if len(parts) != 3 or not parts[2].isdigit() or not (parts[1] == "all" or parts[1].isdigit()):
                 return

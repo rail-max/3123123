@@ -202,6 +202,33 @@ def init_db():
             created_at TIMESTAMP NOT NULL DEFAULT NOW()
         )
     """)
+
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS ad_campaigns (
+            id SERIAL PRIMARY KEY,
+            code TEXT UNIQUE NOT NULL,
+            name TEXT NOT NULL,
+            cost_rub NUMERIC(12, 2) NOT NULL CHECK (cost_rub >= 0),
+            created_at TIMESTAMP NOT NULL DEFAULT NOW()
+        )
+    """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS ad_visits (
+            campaign_id INTEGER NOT NULL REFERENCES ad_campaigns(id),
+            user_id BIGINT NOT NULL,
+            first_seen TIMESTAMP NOT NULL DEFAULT NOW(),
+            PRIMARY KEY (campaign_id, user_id)
+        )
+    """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS ad_acquisitions (
+            user_id BIGINT PRIMARY KEY,
+            campaign_id INTEGER NOT NULL REFERENCES ad_campaigns(id),
+            acquired_at TIMESTAMP NOT NULL DEFAULT NOW(),
+            connected_at TIMESTAMP
+        )
+    """)
+    c.execute("CREATE INDEX IF NOT EXISTS idx_ad_acquisitions_campaign ON ad_acquisitions (campaign_id)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_locked_messages_user ON locked_messages (user_id)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_locked_messages_created ON locked_messages (created_at)")
     c.execute("""
@@ -922,6 +949,123 @@ def get_payment_report(user_id: int | None = None, page: int = 1, page_size: int
         release_conn(conn)
 
 
+def create_ad_campaign(name, code, cost_rub):
+    conn = get_conn()
+    try:
+        with conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as c:
+                c.execute("""
+                    INSERT INTO ad_campaigns (name, code, cost_rub)
+                    VALUES (%s, %s, %s) RETURNING id
+                """, (name, code, cost_rub))
+                return c.fetchone()["id"]
+    finally:
+        release_conn(conn)
+
+
+def set_ad_campaign_cost(campaign_id, cost_rub):
+    conn = get_conn()
+    try:
+        with conn:
+            with conn.cursor() as c:
+                c.execute("UPDATE ad_campaigns SET cost_rub = %s WHERE id = %s RETURNING id",
+                          (cost_rub, campaign_id))
+                return c.fetchone() is not None
+    finally:
+        release_conn(conn)
+
+
+def record_ad_start(code, user_id, username, first_name):
+    """Claim the first source only when this transaction creates the user."""
+    conn = get_conn()
+    try:
+        with conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as c:
+                c.execute("SELECT id FROM ad_campaigns WHERE code = %s", (code,))
+                campaign = c.fetchone()
+                if not campaign:
+                    return
+                campaign_id = campaign["id"]
+                c.execute("""
+                    INSERT INTO users (user_id, username, first_name, sub_type)
+                    VALUES (%s, %s, %s, 'expired')
+                    ON CONFLICT(user_id) DO NOTHING RETURNING user_id
+                """, (user_id, username, first_name))
+                if c.fetchone():
+                    c.execute("""
+                        INSERT INTO ad_acquisitions (user_id, campaign_id)
+                        VALUES (%s, %s) ON CONFLICT(user_id) DO NOTHING
+                    """, (user_id, campaign_id))
+                c.execute("""
+                    INSERT INTO ad_visits (campaign_id, user_id) VALUES (%s, %s)
+                    ON CONFLICT(campaign_id, user_id) DO NOTHING
+                """, (campaign_id, user_id))
+    finally:
+        release_conn(conn)
+
+
+def list_ad_campaigns(page=1, page_size=6):
+    page_size = max(1, min(int(page_size), 10))
+    conn = get_conn()
+    try:
+        with conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as c:
+                c.execute("SELECT COUNT(*) AS total FROM ad_campaigns", ())
+                total = c.fetchone()["total"]
+                pages = max(1, (total + page_size - 1) // page_size)
+                page = max(1, min(int(page), pages))
+                c.execute("""
+                    SELECT a.*,
+                        (SELECT COUNT(*) FROM ad_visits v WHERE v.campaign_id = a.id) AS visitors,
+                        (SELECT COUNT(*) FROM ad_acquisitions n WHERE n.campaign_id = a.id) AS new_users
+                    FROM ad_campaigns a ORDER BY a.id DESC LIMIT %s OFFSET %s
+                """, (page_size, (page - 1) * page_size))
+                return {"rows": [dict(row) for row in c.fetchall()], "page": page, "pages": pages}
+    finally:
+        release_conn(conn)
+
+
+def get_ad_report(campaign_id):
+    conn = get_conn()
+    try:
+        with conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as c:
+                c.execute("SELECT * FROM ad_campaigns WHERE id = %s", (campaign_id,))
+                row = c.fetchone()
+                if not row:
+                    return None
+                report = dict(row)
+                c.execute("SELECT COUNT(*) AS total FROM ad_visits WHERE campaign_id = %s", (campaign_id,))
+                report["visitors"] = c.fetchone()["total"]
+                c.execute("""
+                    SELECT COUNT(*) AS new_users, COUNT(connected_at) AS connected,
+                        COALESCE(SUM(CASE WHEN EXISTS (
+                            SELECT 1 FROM connections c WHERE c.owner_id = a.user_id AND c.is_enabled = 1
+                        ) THEN 1 ELSE 0 END), 0) AS active_connections
+                    FROM ad_acquisitions a WHERE campaign_id = %s
+                """, (campaign_id,))
+                report.update(dict(c.fetchone()))
+                c.execute(f"""
+                    WITH history AS ({_PAYMENT_REPORT_SQL})
+                    SELECT h.currency, COUNT(*) AS paid_count, SUM(h.amount) AS gross,
+                        SUM(CASE WHEN h.status = 'REFUNDED' THEN h.amount ELSE 0 END) AS refunded
+                    FROM history h JOIN ad_acquisitions a ON a.user_id = h.user_id
+                    WHERE a.campaign_id = %s AND h.status IN ('PAID', 'REFUNDED')
+                    GROUP BY h.currency
+                """, (campaign_id,))
+                report["totals"] = {row["currency"]: dict(row) for row in c.fetchall()}
+                c.execute(f"""
+                    WITH history AS ({_PAYMENT_REPORT_SQL})
+                    SELECT COUNT(DISTINCT h.user_id) AS payers
+                    FROM history h JOIN ad_acquisitions a ON a.user_id = h.user_id
+                    WHERE a.campaign_id = %s AND h.status IN ('PAID', 'REFUNDED')
+                """, (campaign_id,))
+                report["payers"] = c.fetchone()["payers"]
+                return report
+    finally:
+        release_conn(conn)
+
+
 def get_payments_by_user(user_id: int, limit: int = 10):
     conn = get_conn()
     c = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
@@ -1206,6 +1350,11 @@ def save_connection(connection_id: str, owner_id: int, is_enabled: bool):
             owner_id = EXCLUDED.owner_id,
             is_enabled = EXCLUDED.is_enabled
     """, (connection_id, owner_id, int(is_enabled)))
+    if is_enabled:
+        c.execute("""
+            UPDATE ad_acquisitions SET connected_at = COALESCE(connected_at, CURRENT_TIMESTAMP)
+            WHERE user_id = %s
+        """, (owner_id,))
     conn.commit()
     release_conn(conn)
 
