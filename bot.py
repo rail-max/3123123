@@ -1208,6 +1208,7 @@ ADS_HELP = (
     "Для бесплатного размещения укажи 0.\n"
     "Изменить расходы: <code>/ads cost ID 2000</code>\n"
     "Отчёт: <code>/ads ID</code>\n"
+    "Восстановить по времени (МСК): <code>/ads recover ID ДД.ММ.ГГГГ ЧЧ:ММ ДД.ММ.ГГГГ ЧЧ:ММ</code>\n"
     "Удалить из списка: <code>/ads delete ID</code> (с подтверждением)"
 )
 
@@ -1266,6 +1267,9 @@ def ad_report_view(campaign_id):
         lines.append(f"Конверсия в оплату: {payers / new_users:.1%}\nЦена нового пользователя: {cost / new_users:,.2f} ₽")
     if payers:
         lines.append(f"Цена плательщика: {cost / payers:,.2f} ₽")
+    if report.get("recovered_users"):
+        lines.append(f"<b>Восстановлено по времени: {report['recovered_users']}</b>\n"
+                     "Эти пользователи включены в итоги как предполагаемые, а не подтверждённые переходы из рекламы.")
     for currency, label in (("XTR", "Stars"), ("RUB", "₽")):
         total = report["totals"].get(currency, {})
         gross, refunded = total.get("gross", 0), total.get("refunded", 0)
@@ -1307,6 +1311,16 @@ def ads_command_view(text):
     parts = text.split(maxsplit=2)
     if len(parts) == 1:
         return ads_list_view()
+    if len(parts) == 3 and parts[1] == "recover":
+        fields = parts[2].split()
+        if len(fields) != 5 or not re.fullmatch(r"[0-9]{1,10}", fields[0]):
+            raise ValueError("Формат: <code>/ads recover 2 05.10.2026 21:00 06.10.2026 21:00</code> (МСК)")
+        try:
+            start = datetime.strptime(" ".join(fields[1:3]), "%d.%m.%Y %H:%M").replace(tzinfo=MSK)
+            end = datetime.strptime(" ".join(fields[3:5]), "%d.%m.%Y %H:%M").replace(tzinfo=MSK)
+        except ValueError:
+            raise ValueError("Не удалось разобрать даты. Пример: 05.10.2026 21:00") from None
+        return ad_recovery_view(int(fields[0]), start, end)
     if len(parts) == 2 and parts[1].isdigit() and len(parts[1]) <= 10:
         return ad_report_view(int(parts[1]))
     if len(parts) == 3 and parts[1] == "delete" and parts[2].isdigit() and len(parts[2]) <= 10:
@@ -1330,6 +1344,32 @@ def ads_command_view(text):
             raise ValueError("Размещение не найдено.")
         return ad_report_view(campaign_id)
     raise ValueError(ADS_HELP)
+
+
+def ad_recovery_view(campaign_id, start, end, apply=False):
+    if not start < end or (end - start).total_seconds() > 31 * 86400:
+        raise ValueError("Конец периода должен быть позже начала; период не больше 31 дня.")
+    report = db.recover_ad_campaign(campaign_id, start, end, ADMIN_ID, apply=apply)
+    period = f"{start.astimezone(MSK):%d.%m.%Y %H:%M} — {end.astimezone(MSK):%d.%m.%Y %H:%M} МСК"
+    lines = [f"<b>Восстановление · #{campaign_id} · {escape_html(report['name'])}</b>", period,
+             f"Пользователей в базе до начала: {report['users_before']}\n"
+             f"Новых за период (без администратора): {report['total']}\n"
+             f"Уже закреплены здесь: {report['already_here']}\n"
+             f"Другой рекламный источник, пропускаем: {report['other_source']}"]
+    if apply:
+        lines.append(f"<b>Добавлено: {report['imported']}</b>. Существующие привязки не изменены.")
+    else:
+        lines.append(f"<b>Будет добавлено: {report['eligible']}</b>\nИз них подключали бота: {report['connected']}")
+    lines.append("Привязка предполагаемая, по первому появлению в базе. Органические заходы тоже могут попасть в отчёт. "
+                 "Подписки и платежи не меняются. Подключения и оплаты этих пользователей попадут в статистику размещения.")
+    if report["pending"]:
+        lines.append("Период ещё не закончился. Сейчас учитываются только уже пришедшие. "
+                     "После окончания повтори ту же команду: дубликатов не будет, автоматического дозаполнения нет.")
+    buttons = [[{"text": "Открыть отчёт", "callback_data": f"ads:view:{campaign_id}"}]]
+    if not apply and report["eligible"]:
+        buttons.insert(0, [{"text": "Подтвердить восстановление", "callback_data":
+                           f"ads:recover:{campaign_id}:{int(start.timestamp())}:{int(end.timestamp())}"}])
+    return "\n\n".join(lines), {"inline_keyboard": buttons}
 
 
 def filter_users(query: str | None):
@@ -2437,7 +2477,19 @@ def handle_update(update: dict):
 
         api("answerCallbackQuery", callback_query_id=cq["id"])
 
-        if data.startswith("ads:") and user_id == ADMIN_ID:
+        if data.startswith("ads:recover:") and user_id == ADMIN_ID:
+            match = re.fullmatch(r"ads:recover:([0-9]{1,10}):([0-9]{10}):([0-9]{10})", data)
+            if not match:
+                return
+            campaign_id, start_ts, end_ts = map(int, match.groups())
+            try:
+                out, keyboard = ad_recovery_view(campaign_id, datetime.fromtimestamp(start_ts, MSK),
+                                                datetime.fromtimestamp(end_ts, MSK), apply=True)
+            except ValueError as exc:
+                out, keyboard = str(exc), {"inline_keyboard": [[{"text": "Все размещения", "callback_data": "ads:list:1"}]]}
+            api("editMessageText", chat_id=cq["message"]["chat"]["id"], message_id=cq["message"]["message_id"],
+                text=out, parse_mode="HTML", reply_markup=keyboard)
+        elif data.startswith("ads:") and user_id == ADMIN_ID:
             parts = data.split(":")
             if len(parts) != 3 or parts[1] not in ("list", "view", "delete", "archive") or not parts[2].isdigit() or len(parts[2]) > 10:
                 return

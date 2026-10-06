@@ -227,9 +227,11 @@ def init_db():
             user_id BIGINT PRIMARY KEY,
             campaign_id INTEGER NOT NULL REFERENCES ad_campaigns(id),
             acquired_at TIMESTAMP NOT NULL DEFAULT NOW(),
+            attribution_method TEXT NOT NULL DEFAULT 'link',
             connected_at TIMESTAMP
         )
     """)
+    c.execute("ALTER TABLE ad_acquisitions ADD COLUMN IF NOT EXISTS attribution_method TEXT NOT NULL DEFAULT 'link'")
     c.execute("CREATE INDEX IF NOT EXISTS idx_ad_acquisitions_campaign ON ad_acquisitions (campaign_id)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_locked_messages_user ON locked_messages (user_id)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_locked_messages_created ON locked_messages (created_at)")
@@ -1041,6 +1043,72 @@ def list_ad_campaigns(page=1, page_size=6):
         release_conn(conn)
 
 
+_AD_RECOVERY_CANDIDATES_SQL = """
+    SELECT u.user_id, u.created_at, a.campaign_id AS existing_campaign,
+        (SELECT MIN(c.connected_at) FROM connections c
+         WHERE c.owner_id = u.user_id AND c.connected_at >= u.created_at) AS connected_at
+    FROM users u LEFT JOIN ad_acquisitions a ON a.user_id = u.user_id
+    WHERE u.user_id <> %s AND u.created_at >= %s AND u.created_at < %s
+"""
+
+
+def recover_ad_campaign(campaign_id, start_at, end_at, admin_id, apply=False):
+    """Infer a source from first-seen times; never replace existing attribution."""
+    if start_at.utcoffset() is None or end_at.utcoffset() is None or not start_at < end_at:
+        raise ValueError("Укажи корректный период восстановления с часовым поясом.")
+    conn = get_conn()
+    try:
+        with conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as c:
+                c.execute("SELECT id, name, archived_at FROM ad_campaigns WHERE id = %s" +
+                          (" FOR UPDATE" if apply else ""), (campaign_id,))
+                campaign = c.fetchone()
+                if not campaign or campaign["archived_at"]:
+                    raise ValueError("Размещение не найдено или находится в архиве.")
+                # Legacy timestamps use NOW() cast to the database session timezone.
+                c.execute("""
+                    SELECT CAST(CAST(%s AS TIMESTAMP WITH TIME ZONE) AS TIMESTAMP) AS start_at,
+                           CAST(CAST(%s AS TIMESTAMP WITH TIME ZONE) AS TIMESTAMP) AS end_at,
+                           CAST(CURRENT_TIMESTAMP AS TIMESTAMP) AS now_at,
+                           current_setting('TimeZone') AS timezone
+                """, (start_at, end_at))
+                bounds = dict(c.fetchone())
+                start, end = bounds["start_at"], min(bounds["end_at"], bounds["now_at"])
+                params = (admin_id, start, end)
+                c.execute(f"""
+                    SELECT COUNT(*) AS total,
+                        COALESCE(SUM(CASE WHEN existing_campaign IS NULL THEN 1 ELSE 0 END), 0) AS eligible,
+                        COALESCE(SUM(CASE WHEN existing_campaign IS NULL AND connected_at IS NOT NULL THEN 1 ELSE 0 END), 0) AS connected,
+                        COALESCE(SUM(CASE WHEN existing_campaign = %s THEN 1 ELSE 0 END), 0) AS already_here,
+                        COALESCE(SUM(CASE WHEN existing_campaign <> %s THEN 1 ELSE 0 END), 0) AS other_source
+                    FROM ({_AD_RECOVERY_CANDIDATES_SQL}) candidates
+                """, (campaign_id, campaign_id) + params)
+                result = dict(c.fetchone())
+                result.update(name=campaign["name"], timezone=bounds["timezone"],
+                              pending=bounds["end_at"] > bounds["now_at"], imported=0)
+                c.execute("SELECT COUNT(*) AS total FROM users WHERE created_at < %s", (start,))
+                result["users_before"] = c.fetchone()["total"]
+                if apply:
+                    c.execute(f"""
+                        INSERT INTO ad_acquisitions (user_id, campaign_id, acquired_at, connected_at, attribution_method)
+                        SELECT user_id, %s, created_at, connected_at, 'time_window'
+                        FROM ({_AD_RECOVERY_CANDIDATES_SQL}) candidates
+                        WHERE existing_campaign IS NULL
+                        ON CONFLICT(user_id) DO NOTHING RETURNING user_id
+                    """, (campaign_id,) + params)
+                    result["imported"] = len(c.fetchall())
+                    c.execute("""
+                        INSERT INTO ad_visits (campaign_id, user_id, first_seen)
+                        SELECT campaign_id, user_id, acquired_at FROM ad_acquisitions
+                        WHERE campaign_id = %s AND attribution_method = 'time_window'
+                          AND acquired_at >= %s AND acquired_at < %s
+                        ON CONFLICT(campaign_id, user_id) DO NOTHING
+                    """, (campaign_id, start, end))
+                return result
+    finally:
+        release_conn(conn)
+
+
 def get_ad_report(campaign_id):
     conn = get_conn()
     try:
@@ -1055,6 +1123,7 @@ def get_ad_report(campaign_id):
                 report["visitors"] = c.fetchone()["total"]
                 c.execute("""
                     SELECT COUNT(*) AS new_users, COUNT(connected_at) AS connected,
+                        COALESCE(SUM(CASE WHEN attribution_method = 'time_window' THEN 1 ELSE 0 END), 0) AS recovered_users,
                         COALESCE(SUM(CASE WHEN EXISTS (
                             SELECT 1 FROM connections c WHERE c.owner_id = a.user_id AND c.is_enabled = 1
                         ) THEN 1 ELSE 0 END), 0) AS active_connections
