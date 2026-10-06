@@ -539,12 +539,75 @@ def connection_reminder_text():
         "<blockquote>"
         "🗑 Уведомления об удалённых сообщениях\n"
         "✏️ Просмотр изменений в переписке\n"
-        "📸 Помощь в сохранении фото, видео, голосовых и кружочков, включая одноразовые медиа"
+        "📸 Помощь в сохранении фото, видео, голосовых и кружочков, включая одноразовые медиа\n"
+        "Все пользователи нашего бота крутые и участвуют в розыгрышах"
         "</blockquote>\n\n"
-        "Для сохранения одноразового медиа ответь на него в чате, пока оно доступно.\n"
-        "Доступ к содержимому зависит от активной подписки.\n\n"
-        "Нажми <b>«Как подключить»</b>, чтобы открыть инструкцию."
+        "Нажми <b>«Как подключить»</b> — мы тебя ждём всей командой!"
     )
+
+
+_REMINDER_BROADCAST_LOCK = threading.Lock()
+_REMINDER_BROADCAST_PENDING = {}
+_REMINDER_BROADCAST_RUNNING = False
+
+
+def send_connection_reminder(user_id):
+    return send(user_id, connection_reminder_text(), keyboard={"inline_keyboard": [
+        [{"text": "Как подключить", "callback_data": "reminder:connect"}],
+    ]})
+
+
+def prepare_reminder_broadcast(chat_id):
+    now_ts = int(time.time())
+    db.enroll_connection_reminders(now_ts, ADMIN_ID)
+    targets = db.get_connection_reminder_targets(ADMIN_ID)
+    send_connection_reminder(chat_id)
+    with _REMINDER_BROADCAST_LOCK:
+        if _REMINDER_BROADCAST_RUNNING:
+            send(chat_id, "Рассылка уже выполняется. Дождись итогового сообщения.")
+            return
+        _REMINDER_BROADCAST_PENDING.clear()
+        if not targets:
+            send(chat_id, "Нет подходящих получателей: неподключённых и не заблокировавших бота.")
+            return
+        token = uuid.uuid4().hex[:16]
+        _REMINDER_BROADCAST_PENDING[token] = {"targets": targets, "expires": now_ts + 600}
+    send(chat_id, f"<b>Отправить приглашение {len(targets)} пользователям?</b>\n\n"
+         "Текст показан выше. После ручной отправки следующее автоматическое напоминание придёт не раньше чем через 36 часов.\n"
+         "Подтверждение действует 10 минут.", keyboard={"inline_keyboard": [[
+             {"text": "Отправить", "callback_data": f"remindsend:{token}"},
+             {"text": "Отмена", "callback_data": f"remindcancel:{token}"},
+         ]]})
+
+
+def run_manual_reminder_broadcast(targets, admin_chat_id):
+    global _REMINDER_BROADCAST_RUNNING
+    sent = failed = skipped = 0
+    try:
+        for target in targets:
+            try:
+                if not db.claim_connection_reminder(target["user_id"], int(time.time()), expected_next_at=target["next_at"]):
+                    skipped += 1
+                    continue
+                if not db.connection_reminder_allowed(target["user_id"]):
+                    skipped += 1
+                    continue
+                result = send_connection_reminder(target["user_id"])
+                if result.get("ok"):
+                    sent += 1
+                else:
+                    failed += 1
+                # Respect rate limits without retrying a possibly delivered message.
+                delay = result.get("parameters", {}).get("retry_after", 0)
+                time.sleep(max(0.1, min(float(delay), 300)))
+            except Exception:
+                failed += 1
+                logging.exception("Manual reminder failed for user_id=%s", target["user_id"])
+    finally:
+        with _REMINDER_BROADCAST_LOCK:
+            _REMINDER_BROADCAST_RUNNING = False
+    send(admin_chat_id, f"<b>Рассылка завершена</b>\nОтправлено: {sent}\n"
+         f"Не подтверждена доставка: {failed}\nПропущено: {skipped}")
 
 
 def run_connection_reminders_once():
@@ -555,9 +618,7 @@ def run_connection_reminders_once():
             continue
         if not db.connection_reminder_allowed(user_id):
             continue
-        send(user_id, connection_reminder_text(), keyboard={"inline_keyboard": [
-            [{"text": "Как подключить", "callback_data": "reminder:connect"}],
-        ]})
+        send_connection_reminder(user_id)
         time.sleep(0.1)
 
 
@@ -1839,6 +1900,7 @@ def get_chat_link(chat: dict) -> str:
 
 
 def handle_update(update: dict):
+    global _REMINDER_BROADCAST_RUNNING
     logging.info(f"UPDATE: {list(update.keys())}")
 
     if "my_chat_member" in update:
@@ -2026,6 +2088,18 @@ def handle_update(update: dict):
                     f"Закрыть: <code>/closesupport {support_user_id}</code>\n\n"
                 )
             send(chat_id, out)
+            return
+
+        if command == "/remind":
+            if user_id != ADMIN_ID or chat_id != ADMIN_ID:
+                send(chat_id, "Команда доступна только администратору в личном чате с ботом.")
+                return
+            if text.strip() == "/remind test":
+                send_connection_reminder(chat_id)
+            elif text.strip() == "/remind":
+                prepare_reminder_broadcast(chat_id)
+            else:
+                send(chat_id, "Рассылка: /remind\nОтправить пример только себе: /remind test")
             return
 
         if command == "/ads":
@@ -2361,6 +2435,8 @@ def handle_update(update: dict):
                 f"/bd [текст] — рассылка всем пользователям (alias /broadcast)\n"
                 f"/bdsub [текст] — рассылка только активным подписчикам\n"
                 f"/bdconn [текст] — рассылка только подключённым\n"
+                f"/remind — приглашение неподключённым (с подтверждением)\n"
+                f"/remind test — пример приглашения только себе\n"
                 f"/admin",
                 keyboard={"inline_keyboard": [
                     [{"text": "Статистика и история оплат", "callback_data": "payhist:all:1"}],
@@ -2509,6 +2585,32 @@ def handle_update(update: dict):
         cq = update["callback_query"]
         user_id = cq["from"]["id"]
         data = cq.get("data", "")
+        if data.startswith(("remindsend:", "remindcancel:")):
+            if user_id != ADMIN_ID or cq.get("message", {}).get("chat", {}).get("id") != ADMIN_ID:
+                api("answerCallbackQuery", callback_query_id=cq["id"], text="Только для администратора в личном чате.", show_alert=True)
+                return
+            token = data.split(":", 1)[1]
+            with _REMINDER_BROADCAST_LOCK:
+                pending = _REMINDER_BROADCAST_PENDING.pop(token, None)
+                if not pending or pending["expires"] < int(time.time()):
+                    answer = "Подтверждение устарело. Введи /remind заново."
+                elif data.startswith("remindcancel:"):
+                    answer = "Рассылка отменена."
+                elif _REMINDER_BROADCAST_RUNNING:
+                    answer = "Рассылка уже выполняется."
+                else:
+                    _REMINDER_BROADCAST_RUNNING = True
+                    try:
+                        threading.Thread(target=run_manual_reminder_broadcast, args=(pending["targets"], ADMIN_ID),
+                                         name="manual-reminders", daemon=True).start()
+                    except Exception:
+                        _REMINDER_BROADCAST_RUNNING = False
+                        raise
+                    answer = "Рассылка запущена. Итоги придут отдельным сообщением."
+            api("answerCallbackQuery", callback_query_id=cq["id"], text=answer)
+            api("editMessageText", chat_id=ADMIN_ID, message_id=cq["message"]["message_id"], text=answer,
+                reply_markup={"inline_keyboard": []})
+            return
         if data == "reminder:stop":
             if cq.get("message", {}).get("chat", {}).get("id") != user_id:
                 api("answerCallbackQuery", callback_query_id=cq["id"], text="Открой личный чат с ботом.", show_alert=True)

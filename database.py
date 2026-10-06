@@ -462,7 +462,24 @@ def get_due_connection_reminders(now_ts, admin_id):
         release_conn(conn)
 
 
-def claim_connection_reminder(user_id, now_ts):
+def get_connection_reminder_targets(admin_id):
+    conn = get_conn()
+    try:
+        with conn:
+            with conn.cursor() as c:
+                c.execute(f"""
+                    SELECT user_id, next_at FROM connection_reminders
+                    WHERE user_id <> %s AND {_REMINDER_ELIGIBLE_SQL}
+                    ORDER BY user_id
+                """, (admin_id,))
+                return [{"user_id": row[0], "next_at": row[1]} for row in c.fetchall()]
+    finally:
+        release_conn(conn)
+
+
+def claim_connection_reminder(user_id, now_ts, expected_next_at=None):
+    schedule_check = "next_at <= %s" if expected_next_at is None else "next_at = %s"
+    schedule_value = now_ts if expected_next_at is None else expected_next_at
     conn = get_conn()
     try:
         with conn:
@@ -470,9 +487,9 @@ def claim_connection_reminder(user_id, now_ts):
                 # Reserve before sending: uncertain network delivery must not cause an immediate retry.
                 c.execute(f"""
                     UPDATE connection_reminders SET attempts = attempts + 1, next_at = %s
-                    WHERE user_id = %s AND next_at <= %s AND {_REMINDER_ELIGIBLE_SQL}
+                    WHERE user_id = %s AND {schedule_check} AND {_REMINDER_ELIGIBLE_SQL}
                     RETURNING user_id
-                """, (now_ts + 36 * 3600, user_id, now_ts))
+                """, (now_ts + 36 * 3600, user_id, schedule_value))
                 return c.fetchone() is not None
     finally:
         release_conn(conn)
