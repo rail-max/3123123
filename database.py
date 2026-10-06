@@ -431,7 +431,7 @@ def enroll_connection_reminders(now_ts, admin_id):
                     INSERT INTO connection_reminders (user_id, next_at)
                     SELECT u.user_id, %s FROM users u
                     WHERE u.user_id <> %s AND NOT u.bot_blocked AND u.sub_type <> 'banned'
-                      AND NOT EXISTS (SELECT 1 FROM connections c WHERE c.owner_id = u.user_id)
+                      AND NOT EXISTS (SELECT 1 FROM connections c WHERE c.owner_id = u.user_id AND c.is_enabled = 1)
                       AND NOT EXISTS (SELECT 1 FROM connection_reminders r WHERE r.user_id = u.user_id)
                     ON CONFLICT(user_id) DO NOTHING
                 """, (now_ts + 36 * 3600, admin_id))
@@ -443,7 +443,7 @@ _REMINDER_ELIGIBLE_SQL = """
     NOT opted_out
     AND EXISTS (SELECT 1 FROM users u WHERE u.user_id = connection_reminders.user_id
                 AND NOT u.bot_blocked AND u.sub_type <> 'banned')
-    AND NOT EXISTS (SELECT 1 FROM connections c WHERE c.owner_id = connection_reminders.user_id)
+    AND NOT EXISTS (SELECT 1 FROM connections c WHERE c.owner_id = connection_reminders.user_id AND c.is_enabled = 1)
 """
 
 

@@ -573,6 +573,8 @@ def prepare_reminder_broadcast(chat_id):
         token = uuid.uuid4().hex[:16]
         _REMINDER_BROADCAST_PENDING[token] = {"targets": targets, "expires": now_ts + 600}
     send(chat_id, f"<b>Отправить приглашение {len(targets)} пользователям?</b>\n\n"
+         "Получатели: без активного подключения сейчас, включая ранее отключившихся. "
+         "Администратор, заблокировавшие бота и забаненные не включены.\n\n"
          "Текст показан выше. После ручной отправки следующее автоматическое напоминание придёт не раньше чем через 36 часов.\n"
          "Подтверждение действует 10 минут.", keyboard={"inline_keyboard": [[
              {"text": "Отправить", "callback_data": f"remindsend:{token}"},
@@ -580,34 +582,63 @@ def prepare_reminder_broadcast(chat_id):
          ]]})
 
 
+def reminder_delivery_outcome(result):
+    if result.get("ok"):
+        return "sent"
+    if result.get("delivery_uncertain") or not result.get("error_code"):
+        return "unknown"
+    code = result["error_code"]
+    description = str(result.get("description") or "").lower()
+    if code == 403 and "bot was blocked by the user" in description:
+        return "blocked"
+    if code in (400, 403) and any(reason in description for reason in (
+        "chat not found", "user is deactivated", "bot can't initiate conversation", "bot cannot initiate conversation",
+    )):
+        return "unavailable"
+    if code == 429:
+        return "rate_limited"
+    return "rejected"
+
+
 def run_manual_reminder_broadcast(targets, admin_chat_id):
     global _REMINDER_BROADCAST_RUNNING
-    sent = failed = skipped = 0
+    counts = dict.fromkeys(("sent", "blocked", "unavailable", "rate_limited", "rejected", "unknown", "internal", "skipped"), 0)
     try:
         for target in targets:
+            result = {}
             try:
                 if not db.claim_connection_reminder(target["user_id"], int(time.time()), expected_next_at=target["next_at"]):
-                    skipped += 1
+                    counts["skipped"] += 1
                     continue
                 if not db.connection_reminder_allowed(target["user_id"]):
-                    skipped += 1
+                    counts["skipped"] += 1
                     continue
                 result = send_connection_reminder(target["user_id"])
-                if result.get("ok"):
-                    sent += 1
-                else:
-                    failed += 1
-                # Respect rate limits without retrying a possibly delivered message.
-                delay = result.get("parameters", {}).get("retry_after", 0)
-                time.sleep(max(0.1, min(float(delay), 300)))
+                outcome = reminder_delivery_outcome(result)
             except Exception:
-                failed += 1
+                outcome = "internal"
                 logging.exception("Manual reminder failed for user_id=%s", target["user_id"])
+            counts[outcome] += 1
+            # Do not retry a possibly delivered message; preserve one outcome per recipient.
+            try:
+                delay = float((result.get("parameters") or {}).get("retry_after", 0))
+            except (TypeError, ValueError):
+                delay = 0
+            time.sleep(max(0.1, min(delay, 300)))
     finally:
         with _REMINDER_BROADCAST_LOCK:
             _REMINDER_BROADCAST_RUNNING = False
-    send(admin_chat_id, f"<b>Рассылка завершена</b>\nОтправлено: {sent}\n"
-         f"Не подтверждена доставка: {failed}\nПропущено: {skipped}")
+    send(admin_chat_id, f"<b>Рассылка завершена</b>\nПолучателей в списке: {len(targets)}\n"
+         f"Отправлено: {counts['sent']}\n"
+         f"Бот заблокирован: {counts['blocked']}\n"
+         f"Чат/аккаунт недоступен или бот не запущен: {counts['unavailable']}\n"
+         f"Ограничение частоты Telegram: {counts['rate_limited']}\n"
+         f"Другие отказы Telegram: {counts['rejected']}\n"
+         f"Результат неизвестен (сеть/ответ API): {counts['unknown']}\n"
+         f"Внутренние ошибки: {counts['internal']}\n"
+         f"Пропущено: {counts['skipped']}\n\n"
+         "«Отправлено» означает успешный ответ Telegram, а не прочтение. "
+         "Пропуски: изменилось подключение/доступность либо напоминание уже отправил автоматический обработчик.")
 
 
 def run_connection_reminders_once():
