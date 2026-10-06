@@ -202,6 +202,17 @@ def init_db():
             created_at TIMESTAMP NOT NULL DEFAULT NOW()
         )
     """)
+    c.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS bot_blocked BOOLEAN NOT NULL DEFAULT FALSE")
+    c.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS bot_status_updated_at BIGINT NOT NULL DEFAULT 0")
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS connection_reminders (
+            user_id BIGINT PRIMARY KEY,
+            next_at BIGINT NOT NULL,
+            attempts INTEGER NOT NULL DEFAULT 0,
+            opted_out BOOLEAN NOT NULL DEFAULT FALSE
+        )
+    """)
+    c.execute("CREATE INDEX IF NOT EXISTS idx_connection_reminders_due ON connection_reminders (next_at)")
 
     c.execute("""
         CREATE TABLE IF NOT EXISTS ad_campaigns (
@@ -396,6 +407,100 @@ def get_user(user_id: int):
     row = c.fetchone()
     release_conn(conn)
     return dict(row) if row else None
+
+
+def set_bot_blocked(user_id, blocked, event_at):
+    conn = get_conn()
+    try:
+        with conn:
+            with conn.cursor() as c:
+                c.execute("""
+                    UPDATE users SET bot_blocked = %s, bot_status_updated_at = %s
+                    WHERE user_id = %s AND bot_status_updated_at <= %s
+                """, (blocked, event_at, user_id, event_at))
+    finally:
+        release_conn(conn)
+
+
+def enroll_connection_reminders(now_ts, admin_id):
+    conn = get_conn()
+    try:
+        with conn:
+            with conn.cursor() as c:
+                c.execute("""
+                    INSERT INTO connection_reminders (user_id, next_at)
+                    SELECT u.user_id, %s FROM users u
+                    WHERE u.user_id <> %s AND NOT u.bot_blocked AND u.sub_type <> 'banned'
+                      AND NOT EXISTS (SELECT 1 FROM connections c WHERE c.owner_id = u.user_id)
+                      AND NOT EXISTS (SELECT 1 FROM connection_reminders r WHERE r.user_id = u.user_id)
+                    ON CONFLICT(user_id) DO NOTHING
+                """, (now_ts + 36 * 3600, admin_id))
+    finally:
+        release_conn(conn)
+
+
+_REMINDER_ELIGIBLE_SQL = """
+    NOT opted_out
+    AND EXISTS (SELECT 1 FROM users u WHERE u.user_id = connection_reminders.user_id
+                AND NOT u.bot_blocked AND u.sub_type <> 'banned')
+    AND NOT EXISTS (SELECT 1 FROM connections c WHERE c.owner_id = connection_reminders.user_id)
+"""
+
+
+def get_due_connection_reminders(now_ts, admin_id):
+    conn = get_conn()
+    try:
+        with conn:
+            with conn.cursor() as c:
+                c.execute(f"""
+                    SELECT user_id FROM connection_reminders
+                    WHERE next_at <= %s AND user_id <> %s AND {_REMINDER_ELIGIBLE_SQL}
+                    ORDER BY next_at, user_id LIMIT 25
+                """, (now_ts, admin_id))
+                return [row[0] for row in c.fetchall()]
+    finally:
+        release_conn(conn)
+
+
+def claim_connection_reminder(user_id, now_ts):
+    conn = get_conn()
+    try:
+        with conn:
+            with conn.cursor() as c:
+                # Reserve before sending: uncertain network delivery must not cause an immediate retry.
+                c.execute(f"""
+                    UPDATE connection_reminders SET attempts = attempts + 1, next_at = %s
+                    WHERE user_id = %s AND next_at <= %s AND {_REMINDER_ELIGIBLE_SQL}
+                    RETURNING user_id
+                """, (now_ts + 36 * 3600, user_id, now_ts))
+                return c.fetchone() is not None
+    finally:
+        release_conn(conn)
+
+
+def connection_reminder_allowed(user_id):
+    conn = get_conn()
+    try:
+        with conn:
+            with conn.cursor() as c:
+                c.execute(f"SELECT user_id FROM connection_reminders WHERE user_id = %s AND {_REMINDER_ELIGIBLE_SQL}", (user_id,))
+                return c.fetchone() is not None
+    finally:
+        release_conn(conn)
+
+
+def opt_out_connection_reminders(user_id):
+    conn = get_conn()
+    try:
+        with conn:
+            with conn.cursor() as c:
+                c.execute("""
+                    INSERT INTO connection_reminders (user_id, next_at, opted_out)
+                    VALUES (%s, 0, TRUE)
+                    ON CONFLICT(user_id) DO UPDATE SET opted_out = TRUE
+                """, (user_id,))
+    finally:
+        release_conn(conn)
 
 
 def get_all_users():

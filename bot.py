@@ -104,6 +104,7 @@ COMMAND_ACTIONS = {
 
 ALLOWED_UPDATES = [
     "message",
+    "my_chat_member",
     "callback_query",
     "business_connection",
     "business_message",
@@ -530,6 +531,47 @@ def get_settings(user_id: int) -> dict:
     return db.get_user_settings(user_id)
 
 
+def connection_reminder_text():
+    return (
+        "🔔 <b>Не пропусти важное сообщение</b>\n\n"
+        "<i>А если собеседник удалит то, что ты не успел прочитать?</i>\n\n"
+        "Подключи <b>DialogDelBot</b> к своим чатам, чтобы пользоваться его возможностями:\n\n"
+        "<blockquote>"
+        "🗑 Уведомления об удалённых сообщениях\n"
+        "✏️ Просмотр изменений в переписке\n"
+        "📸 Помощь в сохранении фото, видео, голосовых и кружочков, включая одноразовые медиа"
+        "</blockquote>\n\n"
+        "Для сохранения одноразового медиа ответь на него в чате, пока оно доступно.\n"
+        "Доступ к содержимому зависит от активной подписки.\n\n"
+        "Нажми <b>«Как подключить»</b>, чтобы открыть инструкцию."
+    )
+
+
+def run_connection_reminders_once():
+    now_ts = int(time.time())
+    db.enroll_connection_reminders(now_ts, ADMIN_ID)
+    for user_id in db.get_due_connection_reminders(now_ts, ADMIN_ID):
+        if not db.claim_connection_reminder(user_id, int(time.time())):
+            continue
+        if not db.connection_reminder_allowed(user_id):
+            continue
+        send(user_id, connection_reminder_text(), keyboard={"inline_keyboard": [
+            [{"text": "Как подключить", "callback_data": "reminder:connect"}],
+        ]})
+        time.sleep(0.1)
+
+
+def start_connection_reminder_worker():
+    def worker():
+        while True:
+            try:
+                run_connection_reminders_once()
+            except Exception:
+                logging.exception("Connection reminder worker failed")
+            time.sleep(60)
+    threading.Thread(target=worker, name="connection-reminders", daemon=True).start()
+
+
 def telegram_post(method, data, content_type, timeout):
     try:
         # Never replay a POST: a lost response can still mean delivery succeeded.
@@ -561,7 +603,20 @@ def telegram_post(method, data, content_type, timeout):
 
 def api(method, **params):
     timeout = 65 if method == "getUpdates" else 20
-    return telegram_post(method, json.dumps(params).encode(), "application/json", timeout)
+    result = telegram_post(method, json.dumps(params).encode(), "application/json", timeout)
+    if method in ("sendMessage", "sendPhoto", "sendVideo", "sendVoice", "sendVideoNote", "sendDocument", "copyMessage"):
+        record_delivery_block(params.get("chat_id"), result, params.get("business_connection_id"))
+    return result
+
+
+def record_delivery_block(chat_id, result, business_connection_id=None):
+    if business_connection_id or not isinstance(chat_id, int) or chat_id <= 0:
+        return
+    if result.get("error_code") == 403 and "bot was blocked by the user" in result.get("description", "").lower():
+        try:
+            db.set_bot_blocked(chat_id, True, int(time.time()))
+        except Exception:
+            logging.exception("Could not persist bot block for user_id=%s", chat_id)
 
 
 def setup_command_menu():
@@ -672,7 +727,9 @@ def send_photo(chat_id, photo_path, caption="", keyboard=None):
     body.extend(photo_data)
     body.extend(f"\r\n--{boundary}--\r\n".encode())
 
-    return telegram_post("sendPhoto", bytes(body), f"multipart/form-data; boundary={boundary}", 20)
+    result = telegram_post("sendPhoto", bytes(body), f"multipart/form-data; boundary={boundary}", 20)
+    record_delivery_block(chat_id, result)
+    return result
 
 
 def send_invoice(chat_id: int, title: str, description: str, payload: str, amount: int):
@@ -766,6 +823,7 @@ def send_local_file(chat_id, file_path, file_type, caption=""):
         method, bytes(body), f"multipart/form-data; boundary={boundary}",
         TELEGRAM_FILE_UPLOAD_TIMEOUT,
     )
+    record_delivery_block(chat_id, response)
     logging.info("Telegram media upload file_type=%s elapsed=%.2fs ok=%s", file_type, time.monotonic() - started_at, response.get("ok"))
     if response.get("ok") and caption and file_type in MEDIA_WITHOUT_CAPTION:
         send(chat_id, caption)
@@ -1373,7 +1431,7 @@ def ad_recovery_view(campaign_id, start, end, apply=False):
 
 
 def filter_users(query: str | None):
-    users = db.get_all_users()
+    users = [user for user in db.get_all_users() if not user.get("bot_blocked")]
     if not query:
         return users
     normalized = query.strip().lower().lstrip("@")
@@ -1406,7 +1464,7 @@ def is_user_sub_active_row(user: dict) -> bool:
 
 
 def get_broadcast_targets(scope: str):
-    users = [user for user in db.get_all_users() if user.get("user_id") != ADMIN_ID]
+    users = [user for user in db.get_all_users() if user.get("user_id") != ADMIN_ID and not user.get("bot_blocked")]
     if scope == "all":
         return [user for user in users if user.get("sub_type") != "banned"]
     if scope == "sub":
@@ -1440,8 +1498,10 @@ def users_page_text_and_keyboard(
     query: str = "",
     connected_only: bool = False,
 ):
+    users = [user for user in users if not user.get("bot_blocked")]
+    connected_ids = set(db.get_connected_owner_ids())
+    visible_connected = sum(user.get("user_id") in connected_ids for user in users)
     if connected_only:
-        connected_ids = set(db.get_connected_owner_ids())
         users = [user for user in users if user.get("user_id") in connected_ids]
     per_page = 10
     total = len(users)
@@ -1453,7 +1513,7 @@ def users_page_text_and_keyboard(
     header = "🔗 <b>Пользователи, подключившие бота:</b>\n" if connected_only else "👥 <b>Пользователи:</b>\n"
     if query:
         header += f"🔎 Поиск: <code>{escape_html(query, 100)}</code>\n"
-    header += f"📄 Страница {page}/{total_pages} · Всего: {total} · Подключены: {len(db.get_connected_owner_ids())}\n\n"
+    header += f"📄 Страница {page}/{total_pages} · Всего: {total} · Подключены: {visible_connected}\n\n"
 
     if not chunk:
         text = header + "Ничего не найдено."
@@ -1780,6 +1840,18 @@ def get_chat_link(chat: dict) -> str:
 
 def handle_update(update: dict):
     logging.info(f"UPDATE: {list(update.keys())}")
+
+    if "my_chat_member" in update:
+        member_update = update["my_chat_member"]
+        chat = member_update.get("chat", {})
+        status = member_update.get("new_chat_member", {}).get("status")
+        if chat.get("type") == "private" and status in ("kicked", "member"):
+            db.set_bot_blocked(chat["id"], status == "kicked", member_update["date"])
+        return
+
+    incoming = update.get("message", {})
+    if (incoming.get("chat", {}).get("type") == "private" and incoming.get("from", {}).get("id") == incoming["chat"]["id"]):
+        db.set_bot_blocked(incoming["chat"]["id"], False, incoming.get("date", int(time.time())))
 
     # ── Успешная оплата ────────────────────────────────────
     if "message" in update and update["message"].get("successful_payment"):
@@ -2437,6 +2509,15 @@ def handle_update(update: dict):
         cq = update["callback_query"]
         user_id = cq["from"]["id"]
         data = cq.get("data", "")
+        if data == "reminder:stop":
+            if cq.get("message", {}).get("chat", {}).get("id") != user_id:
+                api("answerCallbackQuery", callback_query_id=cq["id"], text="Открой личный чат с ботом.", show_alert=True)
+                return
+            db.opt_out_connection_reminders(user_id)
+            api("answerCallbackQuery", callback_query_id=cq["id"], text="Напоминания отключены.")
+            api("editMessageReplyMarkup", chat_id=user_id, message_id=cq["message"]["message_id"],
+                reply_markup={"inline_keyboard": [[{"text": "Как подключить", "callback_data": "reminder:connect"}]]})
+            return
         if data.startswith(("payhist:", "ads:")) and user_id != ADMIN_ID:
             api("answerCallbackQuery", callback_query_id=cq["id"], text="Только для администратора.", show_alert=True)
             return
@@ -2477,7 +2558,10 @@ def handle_update(update: dict):
 
         api("answerCallbackQuery", callback_query_id=cq["id"])
 
-        if data.startswith("ads:recover:") and user_id == ADMIN_ID:
+        if data == "reminder:connect":
+            if cq.get("message", {}).get("chat", {}).get("id") == user_id:
+                send_instruction(user_id)
+        elif data.startswith("ads:recover:") and user_id == ADMIN_ID:
             match = re.fullmatch(r"ads:recover:([0-9]{1,10}):([0-9]{10}):([0-9]{10})", data)
             if not match:
                 return
@@ -2865,6 +2949,7 @@ def main():
     me = api("getMe")
     BOT_USERNAME = me.get("result", {}).get("username", "DialogDelBot")
     setup_command_menu()
+    start_connection_reminder_worker()
 
     print("=" * 40)
     print(f"Бот @{BOT_USERNAME} запущен!")
