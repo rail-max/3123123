@@ -557,26 +557,45 @@ def send_connection_reminder(user_id):
     ]})
 
 
-def prepare_reminder_broadcast(chat_id):
+def send_referral_reminder(user_id):
+    text, keyboard = referral_reminder_view(user_id, "expired")
+    return send(user_id, text, keyboard=keyboard)
+
+
+def prepare_reminder_broadcast(chat_id, kind="connection"):
     now_ts = int(time.time())
-    db.enroll_connection_reminders(now_ts, ADMIN_ID)
-    targets = db.get_connection_reminder_targets(ADMIN_ID)
-    send_connection_reminder(chat_id)
+    if kind == "referral":
+        targets = db.get_manual_referral_reminder_targets(now_ts, ADMIN_ID)
+        send_referral_reminder(chat_id)
+        details = (
+            "Получатели: бот подключён, активной подписки нет. "
+            "Администратор, заблокировавшие бота и забаненные исключены. "
+            "Получившие приглашение подключить бота за последние 24 часа тоже исключены.\n\n"
+            "У каждого получателя будет своя реферальная ссылка. "
+            "Ручная отправка не ждёт 5 дней; следующее автоматическое напоминание будет через 5 дней, "
+            "если пользователь по-прежнему подходит.\n"
+        )
+    else:
+        db.enroll_connection_reminders(now_ts, ADMIN_ID)
+        targets = db.get_connection_reminder_targets(ADMIN_ID)
+        send_connection_reminder(chat_id)
+        details = (
+            "Получатели: без активного подключения сейчас, включая ранее отключившихся. "
+            "Администратор, заблокировавшие бота и забаненные не включены.\n\n"
+            "После ручной отправки следующее автоматическое напоминание придёт не раньше чем через 36 часов.\n"
+        )
     with _REMINDER_BROADCAST_LOCK:
         if _REMINDER_BROADCAST_RUNNING:
             send(chat_id, "Рассылка уже выполняется. Дождись итогового сообщения.")
             return
         _REMINDER_BROADCAST_PENDING.clear()
         if not targets:
-            send(chat_id, "Нет подходящих получателей: неподключённых и не заблокировавших бота.")
+            send(chat_id, "Нет подходящих получателей.\n\n" + details)
             return
         token = uuid.uuid4().hex[:16]
-        _REMINDER_BROADCAST_PENDING[token] = {"targets": targets, "expires": now_ts + 600}
-    send(chat_id, f"<b>Отправить приглашение {len(targets)} пользователям?</b>\n\n"
-         "Получатели: без активного подключения сейчас, включая ранее отключившихся. "
-         "Администратор, заблокировавшие бота и забаненные не включены.\n\n"
-         "Текст показан выше. После ручной отправки следующее автоматическое напоминание придёт не раньше чем через 36 часов.\n"
-         "Подтверждение действует 10 минут.", keyboard={"inline_keyboard": [[
+        _REMINDER_BROADCAST_PENDING[token] = {"targets": targets, "expires": now_ts + 600, "kind": kind}
+    send(chat_id, f"<b>Отправить напоминание {len(targets)} пользователям?</b>\n\n" + details +
+         "Текст показан выше. Подтверждение действует 10 минут.", keyboard={"inline_keyboard": [[
              {"text": "Отправить", "callback_data": f"remindsend:{token}"},
              {"text": "Отмена", "callback_data": f"remindcancel:{token}"},
          ]]})
@@ -600,20 +619,32 @@ def reminder_delivery_outcome(result):
     return "rejected"
 
 
-def run_manual_reminder_broadcast(targets, admin_chat_id):
+def run_manual_reminder_broadcast(targets, admin_chat_id, kind="connection"):
     global _REMINDER_BROADCAST_RUNNING
     counts = dict.fromkeys(("sent", "blocked", "unavailable", "rate_limited", "rejected", "unknown", "internal", "skipped"), 0)
     try:
         for target in targets:
             result = {}
             try:
-                if not db.claim_connection_reminder(target["user_id"], int(time.time()), expected_next_at=target["next_at"]):
-                    counts["skipped"] += 1
-                    continue
-                if not db.connection_reminder_allowed(target["user_id"]):
-                    counts["skipped"] += 1
-                    continue
-                result = send_connection_reminder(target["user_id"])
+                if kind == "referral":
+                    reminder = db.claim_referral_reminder(
+                        target["user_id"], int(time.time()), manual=True,
+                        expected_last_attempt_at=target["last_attempt_at"],
+                    )
+                    if not reminder or not db.referral_reminder_allowed(
+                        target["user_id"], "expired", reminder["sub_expires"], int(time.time()),
+                    ):
+                        counts["skipped"] += 1
+                        continue
+                    result = send_referral_reminder(target["user_id"])
+                else:
+                    if not db.claim_connection_reminder(target["user_id"], int(time.time()), expected_next_at=target["next_at"]):
+                        counts["skipped"] += 1
+                        continue
+                    if not db.connection_reminder_allowed(target["user_id"]):
+                        counts["skipped"] += 1
+                        continue
+                    result = send_connection_reminder(target["user_id"])
                 outcome = reminder_delivery_outcome(result)
             except Exception:
                 outcome = "internal"
@@ -638,7 +669,7 @@ def run_manual_reminder_broadcast(targets, admin_chat_id):
          f"Внутренние ошибки: {counts['internal']}\n"
          f"Пропущено: {counts['skipped']}\n\n"
          "«Отправлено» означает успешный ответ Telegram, а не прочтение. "
-         "Пропуски: изменилось подключение/доступность либо напоминание уже отправил автоматический обработчик.")
+         "Пропуски: изменилось подключение, подписка или доступность; действует пауза между напоминаниями либо их уже отправил другой обработчик.")
 
 
 def run_connection_reminders_once():
@@ -656,10 +687,11 @@ def run_connection_reminders_once():
 def start_connection_reminder_worker():
     def worker():
         while True:
-            try:
-                run_connection_reminders_once()
-            except Exception:
-                logging.exception("Connection reminder worker failed")
+            for task in (run_connection_reminders_once, run_referral_reminders_once):
+                try:
+                    task()
+                except Exception:
+                    logging.exception("Reminder worker failed: %s", task.__name__)
             time.sleep(60)
     threading.Thread(target=worker, name="connection-reminders", daemon=True).start()
 
@@ -1707,6 +1739,65 @@ def get_ref_link(user_id: int) -> str:
     return f"https://t.me/{BOT_USERNAME}?start=ref_{user_id}"
 
 
+def referral_share_url(user_id):
+    text = (
+        "👋 Попробуй DialogDelBot!\n\n"
+        "🗑 Помогает сохранять удалённые сообщения\n"
+        "✏️ Показывает изменения в переписке\n"
+        "📸 Поддерживает фото, видео, голосовые и кружочки\n\n"
+        "🤝 Если подключишь бота к своим чатам, мне начислят 3 дня доступа."
+    )
+    return "https://t.me/share/url?" + urllib.parse.urlencode({"url": get_ref_link(user_id), "text": text})
+
+
+def referral_reminder_view(user_id, kind, expires=None):
+    invite = {"text": "🎁 Пригласить друга +3 дня", "url": referral_share_url(user_id)}
+    if kind == "expiring":
+        text = (
+            "⏳ <b>Подписка скоро закончится</b>\n\n"
+            f"Доступ активен до <b>{expires:%d.%m.%Y %H:%M} МСК</b>.\n\n"
+            "💳 Продли подписку или получи <b>3 дня бесплатно</b> за друга.\n\n"
+            "🎁 Другу нужно перейти по твоей ссылке и подключить бота к своим чатам. "
+            "После подключения тебе начислятся <b>+3 дня</b>."
+        )
+        buttons = [[invite], [{"text": "💳 Продлить подписку", "callback_data": "referral:renew"}]]
+    else:
+        text = (
+            "🔔 <b>Верни доступ к DialogDelBot</b>\n\n"
+            "Бот всё ещё подключён к твоим чатам, но подписка закончилась.\n\n"
+            "🎁 <b>Пригласи друга и получи 3 дня доступа бесплатно!</b>\n\n"
+            "Другу нужно перейти по твоей ссылке и подключить бота к своим чатам. "
+            "После подключения тебе начислятся <b>+3 дня</b>.\n\n"
+            "🤝 Помоги другу не терять важные сообщения — и продолжай пользоваться ботом сам!"
+        )
+        buttons = [[invite]]
+    return text, {"inline_keyboard": buttons}
+
+
+def run_referral_reminders_once():
+    for user_id in db.get_referral_reminder_candidates(int(time.time()), ADMIN_ID):
+        try:
+            reminder = db.claim_referral_reminder(user_id, int(time.time()))
+            if not reminder:
+                continue
+            if not db.referral_reminder_allowed(user_id, reminder["kind"], reminder["sub_expires"], int(time.time())):
+                continue
+            text, keyboard = referral_reminder_view(user_id, reminder["kind"], reminder["sub_expires"])
+            send(user_id, text, keyboard=keyboard)
+            time.sleep(0.1)
+        except Exception:
+            logging.exception("Referral reminder failed for user_id=%s", user_id)
+
+
+def send_subscription_options(chat_id):
+    return send(chat_id,
+        f"💳 <b>Купить подписку</b>\n\n⭐ <b>Telegram Stars:</b>\n"
+        f"{stars_plan_lines('Telegram Stars')}\n\n💳 СБП / QR через Platega: 30 дней — 120 ₽",
+        keyboard={"inline_keyboard": stars_plan_keyboard_rows() + [
+            [{"text": "💳 30 дней — 120 ₽ (СБП / QR)", "callback_data": "buy_platega_monthly", "style": "success"}],
+        ]})
+
+
 def legal_keyboard() -> dict | None:
     privacy_url = PRIVACY_POLICY_URL or public_url("/privacy-policy")
     terms_url = TERMS_URL or public_url("/terms")
@@ -1809,7 +1900,7 @@ def expired_payment_keyboard(user_id: int):
     return {
         "inline_keyboard": stars_plan_keyboard_rows() + [
             [{"text": "💳 30 дней — 120 ₽ (СБП / QR)", "callback_data": "buy_platega_monthly", "style": "success"}],
-            [{"text": "👥 Пригласить друга", "url": get_ref_link(user_id)}],
+            [{"text": "🎁 Пригласить друга +3 дня", "url": referral_share_url(user_id)}],
         ]
     }
 
@@ -2121,6 +2212,19 @@ def handle_update(update: dict):
             send(chat_id, out)
             return
 
+        if command == "/refremind":
+            if user_id != ADMIN_ID or chat_id != ADMIN_ID:
+                send(chat_id, "Только для администратора в личном чате.")
+                return
+            args = text.split()[1:]
+            if args == ["test"]:
+                send_referral_reminder(chat_id)
+            elif not args:
+                prepare_reminder_broadcast(chat_id, kind="referral")
+            else:
+                send(chat_id, "Рассылка: /refremind\nОтправить пример только себе: /refremind test")
+            return
+
         if command == "/remind":
             if user_id != ADMIN_ID or chat_id != ADMIN_ID:
                 send(chat_id, "Команда доступна только администратору в личном чате с ботом.")
@@ -2348,17 +2452,7 @@ def handle_update(update: dict):
             send(chat_id, "Главное меню:", keyboard=main_keyboard())
 
         elif text in ("💳 Подписка", "💳 Купить подписку"):
-            send(chat_id,
-                f"💳 <b>Купить подписку</b>\n\n"
-                f"⭐ <b>Telegram Stars:</b>\n"
-                f"{stars_plan_lines('Telegram Stars')}\n\n"
-                "💳 СБП / QR через Platega: 30 дней — 120 ₽",
-                keyboard={
-                    "inline_keyboard": stars_plan_keyboard_rows() + [
-                        [{"text": "💳 30 дней — 120 ₽ (СБП / QR)", "callback_data": "buy_platega_monthly", "style": "success"}],
-                    ]
-                }
-            )
+            send_subscription_options(chat_id)
 
         elif text in ("📄 Документы",):
             keyboard = legal_keyboard()
@@ -2379,14 +2473,14 @@ def handle_update(update: dict):
         elif text in ("👥 Рефералка", "👥 Пригласить друга"):
             ref_link = get_ref_link(user_id)
             ref_count = db.get_referral_count(user_id)
-            share_url = f"https://t.me/share/url?url={ref_link}&text=Попробуй%20этого%20бота!"
+            share_url = referral_share_url(user_id)
             send(chat_id,
                 f"👥 <b>Пригласи друга — получи +3 дня</b>\n\n"
                 f"За каждого друга, который подключит бота по твоей ссылке, — "
                 f"ты получаешь <b>+3 дня</b> автоматически.\n\n"
                 f"Твоя ссылка:\n<code>{ref_link}</code>\n\n"
                 f"Приглашено друзей: <b>{ref_count}</b>",
-                keyboard={"inline_keyboard": [[{"text": "📤 Поделиться", "url": share_url}]]}
+                keyboard={"inline_keyboard": [[{"text": "🎁 Пригласить друга +3 дня", "url": share_url}]]}
             )
 
         elif text in ("💬 Поддержка",):
@@ -2468,6 +2562,8 @@ def handle_update(update: dict):
                 f"/bdconn [текст] — рассылка только подключённым\n"
                 f"/remind — приглашение неподключённым (с подтверждением)\n"
                 f"/remind test — пример приглашения только себе\n"
+                f"/refremind — реферальное напоминание подключённым без подписки\n"
+                f"/refremind test — пример реферального напоминания себе\n"
                 f"/admin",
                 keyboard={"inline_keyboard": [
                     [{"text": "Статистика и история оплат", "callback_data": "payhist:all:1"}],
@@ -2624,7 +2720,7 @@ def handle_update(update: dict):
             with _REMINDER_BROADCAST_LOCK:
                 pending = _REMINDER_BROADCAST_PENDING.pop(token, None)
                 if not pending or pending["expires"] < int(time.time()):
-                    answer = "Подтверждение устарело. Введи /remind заново."
+                    answer = "Подтверждение устарело. Повтори команду рассылки: /remind или /refremind."
                 elif data.startswith("remindcancel:"):
                     answer = "Рассылка отменена."
                 elif _REMINDER_BROADCAST_RUNNING:
@@ -2632,7 +2728,8 @@ def handle_update(update: dict):
                 else:
                     _REMINDER_BROADCAST_RUNNING = True
                     try:
-                        threading.Thread(target=run_manual_reminder_broadcast, args=(pending["targets"], ADMIN_ID),
+                        threading.Thread(target=run_manual_reminder_broadcast,
+                                         args=(pending["targets"], ADMIN_ID, pending.get("kind", "connection")),
                                          name="manual-reminders", daemon=True).start()
                     except Exception:
                         _REMINDER_BROADCAST_RUNNING = False
@@ -2691,7 +2788,10 @@ def handle_update(update: dict):
 
         api("answerCallbackQuery", callback_query_id=cq["id"])
 
-        if data == "reminder:connect":
+        if data == "referral:renew":
+            if cq.get("message", {}).get("chat", {}).get("id") == user_id:
+                send_subscription_options(user_id)
+        elif data == "reminder:connect":
             if cq.get("message", {}).get("chat", {}).get("id") == user_id:
                 send_instruction(user_id)
         elif data.startswith("ads:recover:") and user_id == ADMIN_ID:

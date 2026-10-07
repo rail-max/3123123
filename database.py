@@ -209,10 +209,23 @@ def init_db():
             user_id BIGINT PRIMARY KEY,
             next_at BIGINT NOT NULL,
             attempts INTEGER NOT NULL DEFAULT 0,
+            last_attempt_at BIGINT,
             opted_out BOOLEAN NOT NULL DEFAULT FALSE
         )
     """)
     c.execute("CREATE INDEX IF NOT EXISTS idx_connection_reminders_due ON connection_reminders (next_at)")
+    c.execute("ALTER TABLE connection_reminders ADD COLUMN IF NOT EXISTS last_attempt_at BIGINT")
+    c.execute("UPDATE connection_reminders SET last_attempt_at = next_at - 129600 WHERE attempts > 0 AND last_attempt_at IS NULL")
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS referral_reminders (
+            user_id BIGINT PRIMARY KEY,
+            observed_expires TIMESTAMP,
+            inactive_since TIMESTAMP,
+            warned_expires TIMESTAMP,
+            last_expired_at TIMESTAMP,
+            last_attempt_at BIGINT
+        )
+    """)
 
     c.execute("""
         CREATE TABLE IF NOT EXISTS ad_campaigns (
@@ -484,12 +497,19 @@ def claim_connection_reminder(user_id, now_ts, expected_next_at=None):
     try:
         with conn:
             with conn.cursor() as c:
+                c.execute("SELECT user_id FROM users WHERE user_id = %s FOR UPDATE", (user_id,))
+                if not c.fetchone():
+                    return False
+                c.execute("SELECT user_id FROM referral_reminders WHERE user_id = %s AND last_attempt_at > %s",
+                          (user_id, now_ts - 86400))
+                if c.fetchone():
+                    return False
                 # Reserve before sending: uncertain network delivery must not cause an immediate retry.
                 c.execute(f"""
-                    UPDATE connection_reminders SET attempts = attempts + 1, next_at = %s
+                    UPDATE connection_reminders SET attempts = attempts + 1, next_at = %s, last_attempt_at = %s
                     WHERE user_id = %s AND {schedule_check} AND {_REMINDER_ELIGIBLE_SQL}
                     RETURNING user_id
-                """, (now_ts + 36 * 3600, user_id, schedule_value))
+                """, (now_ts + 36 * 3600, now_ts, user_id, schedule_value))
                 return c.fetchone() is not None
     finally:
         release_conn(conn)
@@ -518,6 +538,131 @@ def opt_out_connection_reminders(user_id):
                 """, (user_id,))
     finally:
         release_conn(conn)
+
+
+def get_referral_reminder_candidates(now_ts, admin_id):
+    now = datetime.fromtimestamp(now_ts, MSK).replace(tzinfo=None)
+    conn = get_conn()
+    try:
+        with conn:
+            with conn.cursor() as c:
+                c.execute("""
+                    SELECT u.user_id FROM users u
+                    LEFT JOIN referral_reminders r ON r.user_id = u.user_id
+                    WHERE u.user_id <> %s AND NOT u.bot_blocked AND u.sub_type <> 'banned'
+                      AND EXISTS (SELECT 1 FROM connections c WHERE c.owner_id = u.user_id AND c.is_enabled = 1)
+                      AND (u.sub_expires <= %s OR (u.sub_expires IS NULL AND COALESCE(u.sub_remaining_seconds, 0) <= 0))
+                      AND (r.last_attempt_at IS NULL OR r.last_attempt_at <= %s)
+                    ORDER BY u.user_id
+                """, (admin_id, now + timedelta(days=1), now_ts - 86400))
+                return [row[0] for row in c.fetchall()]
+    finally:
+        release_conn(conn)
+
+
+def get_manual_referral_reminder_targets(now_ts, admin_id):
+    now = datetime.fromtimestamp(now_ts, MSK).replace(tzinfo=None)
+    conn = get_conn()
+    try:
+        with conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as c:
+                c.execute("""
+                    SELECT u.user_id, r.last_attempt_at FROM users u
+                    LEFT JOIN referral_reminders r ON r.user_id = u.user_id
+                    WHERE u.user_id <> %s AND NOT u.bot_blocked AND u.sub_type <> 'banned'
+                      AND EXISTS (SELECT 1 FROM connections c WHERE c.owner_id = u.user_id AND c.is_enabled = 1)
+                      AND (u.sub_expires <= %s OR (u.sub_expires IS NULL AND COALESCE(u.sub_remaining_seconds, 0) <= 0))
+                      AND NOT EXISTS (SELECT 1 FROM connection_reminders cr
+                          WHERE cr.user_id = u.user_id AND cr.last_attempt_at > %s)
+                    ORDER BY u.user_id
+                """, (admin_id, now, now_ts - 86400))
+                return [dict(row) for row in c.fetchall()]
+    finally:
+        release_conn(conn)
+
+
+def claim_referral_reminder(user_id, now_ts, manual=False, expected_last_attempt_at=None):
+    now = datetime.fromtimestamp(now_ts, MSK).replace(tzinfo=None)
+    conn = get_conn()
+    try:
+        with conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as c:
+                # Both reminder types lock this user so a reconnect cannot trigger two promos together.
+                c.execute("SELECT * FROM users WHERE user_id = %s FOR UPDATE", (user_id,))
+                row = c.fetchone()
+                if not row or row["bot_blocked"] or row["sub_type"] == "banned":
+                    return None
+                user = dict(row)
+                c.execute("SELECT owner_id FROM connections WHERE owner_id = %s AND is_enabled = 1", (user_id,))
+                if not c.fetchone():
+                    return None
+                c.execute("SELECT * FROM referral_reminders WHERE user_id = %s", (user_id,))
+                row = c.fetchone()
+                state = dict(row) if row else {}
+                if manual and state.get("last_attempt_at") != expected_last_attempt_at:
+                    return None
+                for field in ("observed_expires", "inactive_since", "warned_expires", "last_expired_at"):
+                    if isinstance(state.get(field), str):
+                        state[field] = datetime.fromisoformat(state[field])
+                expires = user.get("sub_expires")
+                if isinstance(expires, str):
+                    expires = datetime.fromisoformat(expires)
+                if not expires and int(user.get("sub_remaining_seconds") or 0) > 0:
+                    return None
+                if state.get("observed_expires") != expires:
+                    state.update(observed_expires=expires, inactive_since=None, last_expired_at=None)
+                kind = None
+                if expires and expires > now:
+                    if manual:
+                        return None
+                    state.update(inactive_since=None, last_expired_at=None)
+                    if expires <= now + timedelta(days=1) and state.get("warned_expires") != expires:
+                        kind = "expiring"
+                else:
+                    state["inactive_since"] = state.get("inactive_since") or expires or now
+                    due = (state.get("last_expired_at") or state["inactive_since"]) + timedelta(days=5)
+                    if manual or now >= due:
+                        kind = "expired"
+                c.execute("SELECT last_attempt_at FROM connection_reminders WHERE user_id = %s", (user_id,))
+                other = c.fetchone()
+                recent = [None if manual else state.get("last_attempt_at"), other["last_attempt_at"] if other else None]
+                if any(stamp is not None and stamp > now_ts - 86400 for stamp in recent):
+                    kind = None
+                if kind:
+                    state["last_attempt_at"] = now_ts
+                    if kind == "expiring":
+                        state["warned_expires"] = expires
+                    else:
+                        state["last_expired_at"] = now
+                c.execute("""
+                    INSERT INTO referral_reminders (user_id, observed_expires, inactive_since, warned_expires, last_expired_at, last_attempt_at)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                    ON CONFLICT(user_id) DO UPDATE SET
+                        observed_expires = EXCLUDED.observed_expires, inactive_since = EXCLUDED.inactive_since,
+                        warned_expires = EXCLUDED.warned_expires, last_expired_at = EXCLUDED.last_expired_at,
+                        last_attempt_at = EXCLUDED.last_attempt_at
+                """, (user_id, expires, state.get("inactive_since"), state.get("warned_expires"),
+                      state.get("last_expired_at"), state.get("last_attempt_at")))
+                return {"kind": kind, "sub_expires": expires} if kind else None
+    finally:
+        release_conn(conn)
+
+
+def referral_reminder_allowed(user_id, kind, expected_expires, now_ts):
+    now = datetime.fromtimestamp(now_ts, MSK).replace(tzinfo=None)
+    user = get_user(user_id)
+    if not user or user.get("bot_blocked") or user.get("sub_type") == "banned":
+        return False
+    if not get_connections_count_for_user(user_id):
+        return False
+    expires = user.get("sub_expires")
+    if isinstance(expires, str):
+        expires = datetime.fromisoformat(expires)
+    if expires != expected_expires:
+        return False
+    if kind == "expiring":
+        return expires is not None and now < expires <= now + timedelta(days=1)
+    return kind == "expired" and (expires <= now if expires else int(user.get("sub_remaining_seconds") or 0) <= 0)
 
 
 def get_all_users():
