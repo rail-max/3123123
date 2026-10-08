@@ -231,7 +231,7 @@ def submit_media_task(executor, slots, function, *args):
     return future
 
 
-def create_pending_locked_message(user_id: int, event_type: str, chat_link: str, reply_to_message: dict | None = None, saved_text: str | None = None) -> str:
+def create_pending_locked_message(user_id: int, event_type: str, chat_link: str, reply_to_message: dict | None = None, saved_text: str | None = None, source_key: str | None = None) -> str:
     token = uuid.uuid4().hex
     pending = {
         "user_id": user_id,
@@ -239,6 +239,7 @@ def create_pending_locked_message(user_id: int, event_type: str, chat_link: str,
         "chat_link": chat_link,
         "reply_to_message": reply_to_message,
         "saved_text": saved_text,
+        "source_key": source_key,
         "created_at": int(time.time()),
     }
     db.save_locked_message(token, user_id, pending)
@@ -299,6 +300,7 @@ def deliver_locked_message(token, user_id, message_id):
         if result.get("ok"):
             db.finish_locked_message(token, user_id, delivered=True)
             _PENDING_LOCKED_MESSAGES.pop(token, None)
+            record_delivered_result(user_id, pending.get("source_key"))
         elif is_text or not result.get("delivery_uncertain"):
             # Editing the original notification is idempotent; media sends are not.
             db.finish_locked_message(token, user_id, delivered=False)
@@ -1254,6 +1256,7 @@ def deliver_business_reply_media(owner_id, msg, key, queued_at):
         )
         logging.info("Reply media worker elapsed=%.2fs ok=%s", time.monotonic() - started_at, result.get("ok"))
         if result.get("ok"):
+            record_delivered_result(owner_id, useful_result_key(msg["business_connection_id"], msg["chat"]["id"], reply.get("message_id")))
             return
         if not result.get("delivery_uncertain"):
             forget_business_reply_media(key)
@@ -1750,6 +1753,33 @@ def referral_share_url(user_id):
     return "https://t.me/share/url?" + urllib.parse.urlencode({"url": get_ref_link(user_id), "text": text})
 
 
+def useful_result_key(connection_id, chat_id, message_id):
+    if message_id is None:
+        return None
+    return json.dumps([connection_id, chat_id, message_id], separators=(",", ":"))
+
+
+def record_delivered_result(user_id, source_key):
+    if not source_key:
+        return
+    try:
+        if not db.record_useful_result(user_id, source_key, int(time.time())):
+            return
+        result = send(user_id,
+            "Уже 10 сообщений не потерялись 👀\n\n"
+            "🎁 Поделись DialogDelBot с другом и получи <b>ещё 3 дня бесплатно</b>, "
+            "когда он подключит бота к своим чатам.\n\n"
+            "Ты получаешь больше доступа, а друг не теряет важное 🤝",
+            keyboard={"inline_keyboard": [[
+                {"text": "🎁 Пригласить друга +3 дня", "url": referral_share_url(user_id)},
+            ]]})
+        if not result.get("ok"):
+            logging.warning("Referral milestone delivery not confirmed for user_id=%s", user_id)
+    except Exception:
+        # A referral prompt failure must never turn a successful content delivery into a retry.
+        logging.exception("Referral milestone failed for user_id=%s", user_id)
+
+
 def referral_reminder_view(user_id, kind, expires=None):
     invite = {"text": "🎁 Пригласить друга +3 дня", "url": referral_share_url(user_id)}
     if kind == "expiring":
@@ -1912,9 +1942,10 @@ def send_expired_message(
     locked: bool = False,
     reply_to_message: dict | None = None,
     saved_text: str | None = None,
+    source_key: str | None = None,
 ):
     if locked and event_type in ("deleted", "reply_media", "edited"):
-        token = create_pending_locked_message(user_id, event_type, chat_link, reply_to_message, saved_text)
+        token = create_pending_locked_message(user_id, event_type, chat_link, reply_to_message, saved_text, source_key)
         if event_type == "edited":
             title = f"✏️ <b>В чате с {chat_link} изменено сообщение</b>"
             description = "Чтобы увидеть изменения, нажмите кнопку ниже."
@@ -2991,6 +3022,7 @@ def handle_update(update: dict):
                     get_chat_link(msg["chat"]),
                     locked=True,
                     reply_to_message=reply_to_message,
+                    source_key=useful_result_key(conn_id, msg["chat"]["id"], replied_message_id),
                 )
                 return
             key = (owner_id, conn_id, msg["chat"]["id"], replied_message_id, media_file_id)
@@ -3080,13 +3112,15 @@ def handle_update(update: dict):
                 f"<b>Стало:</b>\n{escape_html(new_text, 1500)}"
             )
             if not db.is_sub_active(owner_id):
-                result = send_expired_message(owner_id, "edited", get_chat_link(msg["chat"]), locked=True, saved_text=edit_text)
+                result = send_expired_message(owner_id, "edited", get_chat_link(msg["chat"]), locked=True, saved_text=edit_text,
+                                              source_key=useful_result_key(conn_id, msg["chat"]["id"], msg["message_id"]))
                 if result.get("ok"):
                     db.update_cached_text(conn_id, msg["chat"]["id"], msg["message_id"], new_text)
                 return
 
             result = send(owner_id, edit_text)
             if result.get("ok"):
+                record_delivered_result(owner_id, useful_result_key(conn_id, msg["chat"]["id"], msg["message_id"]))
                 db.update_cached_text(conn_id, msg["chat"]["id"], msg["message_id"], new_text)
 
     # ── Удалённые сообщения ────────────────────────────────
@@ -3127,14 +3161,16 @@ def handle_update(update: dict):
                         f"🕐 {cached_item['date']}\n\n"
                         f"<b>Текст:</b>\n{escape_html(cached_item['text'], 3400)}"
                     )
-                    result = send_expired_message(owner_id, "deleted", chat_link, locked=True, saved_text=saved_text)
+                    result = send_expired_message(owner_id, "deleted", chat_link, locked=True, saved_text=saved_text,
+                                                  source_key=useful_result_key(conn_id, chat_id, msg_id))
                     if result.get("ok"):
                         db.delete_cached_message(conn_id, chat_id, msg_id)
                 else:
                     media_type = cached_item["file_type"]
                     media = {"file_id": cached_item["file_id"]}
                     reply = {media_type: [media] if media_type == "photo" else media}
-                    result = send_expired_message(owner_id, "deleted", chat_link, locked=True, reply_to_message=reply)
+                    result = send_expired_message(owner_id, "deleted", chat_link, locked=True, reply_to_message=reply,
+                                                  source_key=useful_result_key(conn_id, chat_id, msg_id))
                     if result.get("ok"):
                         db.delete_cached_media(conn_id, chat_id, msg_id)
             return
@@ -3147,6 +3183,7 @@ def handle_update(update: dict):
                     f"<b>Текст:</b>\n{escape_html(cached_item['text'], 3400)}"
                 )
                 if result.get("ok"):
+                    record_delivered_result(owner_id, useful_result_key(conn_id, chat_id, msg_id))
                     db.delete_cached_message(conn_id, chat_id, msg_id)
                 continue
 
@@ -3162,6 +3199,7 @@ def handle_update(update: dict):
                 fallback_to_upload=True,
             )
             if result.get("ok"):
+                record_delivered_result(owner_id, useful_result_key(conn_id, chat_id, msg_id))
                 db.delete_cached_media(conn_id, chat_id, msg_id)
 
 

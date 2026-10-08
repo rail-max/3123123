@@ -228,6 +228,19 @@ def init_db():
     """)
 
     c.execute("""
+        CREATE TABLE IF NOT EXISTS referral_milestones (
+            user_id BIGINT PRIMARY KEY,
+            prompted BOOLEAN NOT NULL DEFAULT FALSE
+        )
+    """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS referral_results (
+            user_id BIGINT NOT NULL,
+            source_key TEXT NOT NULL,
+            PRIMARY KEY (user_id, source_key)
+        )
+    """)
+    c.execute("""
         CREATE TABLE IF NOT EXISTS ad_campaigns (
             id SERIAL PRIMARY KEY,
             code TEXT UNIQUE NOT NULL,
@@ -536,6 +549,35 @@ def opt_out_connection_reminders(user_id):
                     VALUES (%s, 0, TRUE)
                     ON CONFLICT(user_id) DO UPDATE SET opted_out = TRUE
                 """, (user_id,))
+    finally:
+        release_conn(conn)
+
+
+def record_useful_result(user_id, source_key, now_ts):
+    conn = get_conn()
+    try:
+        with conn:
+            with conn.cursor() as c:
+                # Serialize deliveries and reminder claims for this user across workers.
+                c.execute("SELECT user_id FROM users WHERE user_id = %s AND NOT bot_blocked AND sub_type <> 'banned' FOR UPDATE", (user_id,))
+                if not c.fetchone():
+                    return False
+                c.execute("INSERT INTO referral_milestones (user_id) VALUES (%s) ON CONFLICT(user_id) DO NOTHING", (user_id,))
+                c.execute("SELECT prompted FROM referral_milestones WHERE user_id = %s", (user_id,))
+                if c.fetchone()[0]:
+                    return False
+                c.execute("INSERT INTO referral_results (user_id, source_key) VALUES (%s, %s) ON CONFLICT(user_id, source_key) DO NOTHING",
+                          (user_id, source_key))
+                c.execute("SELECT COUNT(*) FROM referral_results WHERE user_id = %s", (user_id,))
+                if c.fetchone()[0] < 10:
+                    return False
+                # Reserve before sending: an uncertain Telegram response must not cause duplicates.
+                c.execute("UPDATE referral_milestones SET prompted = TRUE WHERE user_id = %s", (user_id,))
+                c.execute("""
+                    INSERT INTO referral_reminders (user_id, last_attempt_at) VALUES (%s, %s)
+                    ON CONFLICT(user_id) DO UPDATE SET last_attempt_at = EXCLUDED.last_attempt_at
+                """, (user_id, now_ts))
+                return True
     finally:
         release_conn(conn)
 
