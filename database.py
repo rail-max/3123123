@@ -262,11 +262,13 @@ def init_db():
                 code TEXT UNIQUE NOT NULL,
                 name TEXT NOT NULL,
                 cost_rub NUMERIC(12, 2) NOT NULL CHECK (cost_rub >= 0),
+                purchased_on DATE,
                 archived_at TIMESTAMP,
                 created_at TIMESTAMP NOT NULL DEFAULT NOW()
             )
         """)
         c.execute("ALTER TABLE ad_campaigns ADD COLUMN IF NOT EXISTS archived_at TIMESTAMP")
+        c.execute("ALTER TABLE ad_campaigns ADD COLUMN IF NOT EXISTS purchased_on DATE")
         c.execute("""
             CREATE TABLE IF NOT EXISTS ad_visits (
                 campaign_id INTEGER NOT NULL REFERENCES ad_campaigns(id),
@@ -365,6 +367,7 @@ def init_db():
         c.execute("CREATE INDEX IF NOT EXISTS idx_connections_owner_enabled ON connections (owner_id, is_enabled)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_connections_enabled ON connections (is_enabled)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_referrals_referrer ON referrals (referrer_id)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_referrals_recent ON referrals (created_at DESC NULLS LAST, id DESC)")
         c.execute("DROP INDEX IF EXISTS idx_referrals_referred")
         c.execute("CREATE INDEX IF NOT EXISTS idx_user_settings_active ON user_settings (support_active)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_payments_user_id ON payments (user_id)")
@@ -1244,9 +1247,9 @@ def create_ad_campaign(name, code, cost_rub):
         with conn:
             with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as c:
                 c.execute("""
-                    INSERT INTO ad_campaigns (name, code, cost_rub)
-                    VALUES (%s, %s, %s) RETURNING id
-                """, (name, code, cost_rub))
+                    INSERT INTO ad_campaigns (name, code, cost_rub, purchased_on)
+                    VALUES (%s, %s, %s, %s) RETURNING id
+                """, (name, code, cost_rub, now_msk().date()))
                 return c.fetchone()["id"]
     finally:
         release_conn(conn)
@@ -1259,6 +1262,18 @@ def set_ad_campaign_cost(campaign_id, cost_rub):
             with conn.cursor() as c:
                 c.execute("UPDATE ad_campaigns SET cost_rub = %s WHERE id = %s RETURNING id",
                           (cost_rub, campaign_id))
+                return c.fetchone() is not None
+    finally:
+        release_conn(conn)
+
+
+def set_ad_campaign_date(campaign_id, purchased_on):
+    conn = get_conn()
+    try:
+        with conn:
+            with conn.cursor() as c:
+                c.execute("UPDATE ad_campaigns SET purchased_on = %s WHERE id = %s RETURNING id",
+                          (purchased_on, campaign_id))
                 return c.fetchone() is not None
     finally:
         release_conn(conn)
@@ -1413,6 +1428,13 @@ def get_ad_report(campaign_id):
                             SELECT 1 FROM connections c WHERE c.owner_id = a.user_id AND c.is_enabled = 1
                         ) THEN 1 ELSE 0 END), 0) AS active_connections
                     FROM ad_acquisitions a WHERE campaign_id = %s
+                """, (campaign_id,))
+                report.update(dict(c.fetchone()))
+                c.execute("""
+                    SELECT COUNT(*) AS referred_friends,
+                        COALESCE(SUM(CASE WHEN r.rewarded = TRUE THEN 1 ELSE 0 END), 0) AS activated_friends
+                    FROM referrals r JOIN ad_acquisitions a ON a.user_id = r.referrer_id
+                    WHERE a.campaign_id = %s
                 """, (campaign_id,))
                 report.update(dict(c.fetchone()))
                 c.execute(f"""
@@ -1864,6 +1886,36 @@ def get_referral_count(user_id: int) -> int:
         c.execute("SELECT COUNT(*) FROM referrals WHERE referrer_id = %s AND rewarded = TRUE", (user_id,))
         count = c.fetchone()[0]
         return count
+    finally:
+        release_conn(conn)
+
+
+def get_referral_history(page=1, page_size=6):
+    page_size = max(1, min(int(page_size), 10))
+    conn = get_conn()
+    try:
+        with conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as c:
+                c.execute("""
+                    SELECT COUNT(*) AS total,
+                        COALESCE(SUM(CASE WHEN rewarded = TRUE THEN 1 ELSE 0 END), 0) AS activated
+                    FROM referrals
+                """)
+                result = dict(c.fetchone())
+                pages = max(1, (result["total"] + page_size - 1) // page_size)
+                page = max(1, min(int(page), pages))
+                c.execute("""
+                    SELECT r.referrer_id, r.referred_id, r.rewarded,
+                        EXTRACT(EPOCH FROM r.created_at AT TIME ZONE current_setting('TimeZone')) AS created_timestamp,
+                        inviter.username AS referrer_username, inviter.first_name AS referrer_name,
+                        friend.username AS referred_username, friend.first_name AS referred_name
+                    FROM referrals r
+                    LEFT JOIN users inviter ON inviter.user_id = r.referrer_id
+                    LEFT JOIN users friend ON friend.user_id = r.referred_id
+                    ORDER BY r.created_at DESC NULLS LAST, r.id DESC LIMIT %s OFFSET %s
+                """, (page_size, (page - 1) * page_size))
+                result.update(rows=[dict(row) for row in c.fetchall()], page=page, pages=pages)
+                return result
     finally:
         release_conn(conn)
 

@@ -1401,6 +1401,7 @@ ADS_HELP = (
     "Цена — последнее число. Вариант с | тоже работает.\n"
     "Для бесплатного размещения укажи 0.\n"
     "Изменить расходы: <code>/ads cost ID 2000</code>\n"
+    "Дата закупки: <code>/ads date ID ДД.ММ.ГГГГ</code> (для новых — сегодня)\n"
     "Отчёт: <code>/ads ID</code>\n"
     "Восстановить по времени (МСК): <code>/ads recover ID ДД.ММ.ГГГГ ЧЧ:ММ ДД.ММ.ГГГГ ЧЧ:ММ</code>\n"
     "Удалить из списка: <code>/ads delete ID</code> (с подтверждением)"
@@ -1421,6 +1422,7 @@ def ads_list_view(page=1):
     for row in report["rows"]:
         lines.append(
             f"<b>#{row['id']} · {escape_html(row['name'])}</b>\n"
+            f"Дата закупки: {format_db_date(row.get('purchased_on'))}\n"
             f"Расходы: {row['cost_rub']:,.2f} ₽ · запусков: {row['visitors']} · новых: {row['new_users']}"
         )
         buttons.append([{"text": f"#{row['id']} · {row['name'][:45]}", "callback_data": f"ads:view:{row['id']}"}])
@@ -1450,12 +1452,15 @@ def ad_report_view(campaign_id):
         f"<b>#{report['id']} · {escape_html(report['name'])}</b>",
         "<b>В архиве.</b> Новые заходы по ссылке не учитываются." if report.get("archived_at") else f"Ссылка для рекламы:\n{link}",
         f"Расходы: <b>{cost:,.2f} ₽</b>",
+        f"Дата закупки: <b>{format_db_date(report.get('purchased_on'))}</b>",
         f"Уникальных запусков: <b>{report['visitors']}</b>\n"
         f"Новых пользователей: <b>{new_users}</b>\n"
         f"Уже были в боте: {report['visitors'] - new_users}",
         f"Из новых:\nПодключили бота: <b>{report['connected']}</b>\n"
         f"Подключены сейчас: {report['active_connections']}\n"
         f"Оплатили хотя бы раз: <b>{payers}</b>",
+        f"Рефералы · приглашённые ими друзья: <b>{report.get('referred_friends', 0)}</b>\n"
+        f"Из них подключили бота: <b>{report.get('activated_friends', 0)}</b>",
     ]
     if new_users:
         lines.append(f"Конверсия в оплату: {payers / new_users:.1%}\nЦена нового пользователя: {cost / new_users:,.2f} ₽")
@@ -1469,11 +1474,6 @@ def ad_report_view(campaign_id):
         gross, refunded = total.get("gross", 0), total.get("refunded", 0)
         lines.append(f"<b>Оплаты · {label}</b>\nПлатежей: {total.get('paid_count', 0)}\n"
                      f"Получено: {gross:,}\nВозвращено: {refunded:,}\nПосле возвратов: {gross - refunded:,}")
-    lines.append(
-        "<i>Считаются запуски через ссылку, не клики. Повторы не добавляют людей. "
-        "Новые пользователи закреплены за первым источником; подключения и оплаты только от них, за всё время. "
-        "Плательщики включают возвраты. Суммы без комиссий; Stars не складываются с рублями.</i>"
-    )
     buttons = [[
         {"text": "Обновить", "callback_data": f"ads:view:{campaign_id}"}, back,
     ]]
@@ -1505,6 +1505,18 @@ def ads_command_view(text):
     parts = text.split(maxsplit=2)
     if len(parts) == 1:
         return ads_list_view()
+    if len(parts) == 3 and parts[1] == "date":
+        fields = parts[2].split()
+        if len(fields) != 2 or not re.fullmatch(r"[0-9]{1,10}", fields[0]) or not re.fullmatch(r"[0-9]{2}\.[0-9]{2}\.[0-9]{4}", fields[1]):
+            raise ValueError("Формат: <code>/ads date 2 05.10.2026</code>")
+        try:
+            purchased_on = datetime.strptime(fields[1], "%d.%m.%Y").date()
+        except ValueError:
+            raise ValueError("Такой даты нет. Пример: <code>/ads date 2 05.10.2026</code>") from None
+        campaign_id = int(fields[0])
+        if not db.set_ad_campaign_date(campaign_id, purchased_on):
+            raise ValueError("Размещение не найдено.")
+        return ad_report_view(campaign_id)
     if len(parts) == 3 and parts[1] == "recover":
         fields = parts[2].split()
         if len(fields) != 5 or not re.fullmatch(r"[0-9]{1,10}", fields[0]):
@@ -1707,29 +1719,44 @@ def users_page_text_and_keyboard(
     return text, keyboard
 
 
-def referrals_text(page: int = 1, query: str = "") -> tuple[str, dict | None]:
-    leaderboard = db.get_referral_leaderboard(limit=15)
-    total_referrals = sum(item.get("referrals_count", 0) for item in leaderboard)
-    lines = ["🎁 <b>Реферальная программа</b>", "", f"Всего приглашений в топе: <b>{total_referrals}</b>", ""]
-    for index, item in enumerate(leaderboard, start=1):
-        user_id = item.get("referrer_id")
-        username = item.get("username")
-        name = item.get("first_name") or username or str(user_id)
-        referred = db.get_referrals_by_referrer(user_id)
-        preview = []
-        for row in referred[:5]:
-            referred_name = row.get("first_name") or row.get("username") or str(row.get("referred_id"))
-            if row.get("username"):
-                referred_name = f"@{row['username']}"
-            preview.append(escape_html(referred_name, 100))
-        preview_text = ", ".join(preview) if preview else "нет"
-        lines.append(
-            f"{index}. {escape_html(name, 100)} (<code>{user_id}</code>) — <b>{item.get('referrals_count', 0)}</b>\n"
-            f"   Кого привёл: {preview_text}"
-        )
+def referrals_text(page: int = 1, query: str = "", mode: str = "recent", history_page: int = 1) -> tuple[str, dict | None]:
+    report = db.get_referral_history(page=history_page)
+    lines = ["🎁 <b>Реферальная программа</b>",
+             f"Всего приглашений: <b>{report['total']}</b>\nПодключение засчитано: <b>{report['activated']}</b>"]
     encoded_query = encode_user_query(query)
-    keyboard = {"inline_keyboard": [[{"text": "🔙 Назад", "callback_data": f"users:all:{page}:{encoded_query}"}]]}
-    return "\n".join(lines), keyboard
+
+    def button(label, view, number=1):
+        return {"text": label, "callback_data": f"refhist:{view}:{number}:{page}:{encoded_query}"}
+
+    buttons = [[button("Последние", "recent"), button("Топ по приглашениям", "top")]]
+    if mode == "top":
+        lines.append("<b>Топ по засчитанным подключениям</b>")
+        for index, item in enumerate(db.get_referral_leaderboard(limit=15), start=1):
+            name = f"@{item['username']}" if item.get("username") else item.get("first_name") or str(item['referrer_id'])
+            lines.append(f"{index}. {escape_html(name, 60)} (<code>{item['referrer_id']}</code>): <b>{item['referrals_count']}</b>")
+    else:
+        lines.append("<b>Последние приглашения · время МСК</b>")
+        for row in report["rows"]:
+            people = []
+            for role in ("referrer", "referred"):
+                name = f"@{row[role + '_username']}" if row.get(role + "_username") else row.get(role + "_name") or str(row[role + '_id'])
+                people.append(f"{escape_html(name, 40)} (<code>{row[role + '_id']}</code>)")
+            joined_at = format_ts_msk(float(row["created_timestamp"])) if row.get("created_timestamp") is not None else "дата неизвестна"
+            status = "Подключение засчитано" if row["rewarded"] else "Ждём подключения"
+            lines.append(f"{joined_at}\nКто пригласил: {people[0]}\nКого: {people[1]}\n{status}")
+        if not report["rows"]:
+            lines.append("Приглашений пока нет.")
+        lines.append(f"Страница {report['page']}/{report['pages']}")
+        nav = []
+        if report["page"] > 1:
+            nav.append(button("Назад", "recent", report["page"] - 1))
+        if report["page"] < report["pages"]:
+            nav.append(button("Далее", "recent", report["page"] + 1))
+        if nav:
+            buttons.append(nav)
+    buttons.append([button("Обновить", mode, report["page"])])
+    buttons.append([{"text": "К пользователям", "callback_data": f"users:all:{page}:{encoded_query}"}])
+    return "\n\n".join(lines), {"inline_keyboard": buttons}
 
 
 def copy_message(chat_id: int, from_chat_id: int, message_id: int):
@@ -2931,7 +2958,22 @@ def handle_update(update: dict):
             s[field] = value == "1"
             db.save_user_settings(user_id, s["track_deleted"], s["track_edited"], s.get("support_mode", False), s.get("support_active", False))
             api("editMessageReplyMarkup", chat_id=chat_id, message_id=cq["message"]["message_id"], reply_markup=settings_keyboard(user_id))
+        elif data.startswith("refhist:") and user_id == ADMIN_ID:
+            if cq["message"]["chat"]["id"] != user_id:
+                return
+            parts = data.split(":", 4)
+            if len(parts) != 5 or parts[1] not in ("recent", "top") or not all(re.fullmatch(r"[0-9]{1,10}", p) for p in parts[2:4]):
+                return
+            query = decode_user_query(parts[4])
+            if query is None:
+                send(ADMIN_ID, "Поиск устарел. Повтори /users с нужным именем.")
+                return
+            text_out, keyboard = referrals_text(page=int(parts[3]), query=query, mode=parts[1], history_page=int(parts[2]))
+            api("editMessageText", chat_id=user_id, message_id=cq["message"]["message_id"],
+                text=text_out, parse_mode="HTML", reply_markup=keyboard)
         elif data.startswith("users:ref:") and user_id == ADMIN_ID:
+            if cq["message"]["chat"]["id"] != user_id:
+                return
             _, _, page_str, encoded_query = data.split(":", 3)
             page = int(page_str)
             query = decode_user_query(encoded_query)
@@ -3196,6 +3238,7 @@ def handle_update(update: dict):
     # ── Удалённые сообщения ────────────────────────────────
     elif "deleted_business_messages" in update:
         event = update["deleted_business_messages"]
+        # Telegram does not identify the deleter; chat.id is the peer, not the actor.
         conn_id = event.get("business_connection_id", "")
         owner_id = get_business_owner(conn_id)
         if not owner_id:
