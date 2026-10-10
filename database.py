@@ -5,6 +5,8 @@ import hashlib
 import logging
 import os
 import json
+import threading
+import time
 import psycopg2
 import psycopg2.extras
 from psycopg2.pool import ThreadedConnectionPool
@@ -21,6 +23,8 @@ MSK = ZoneInfo("Europe/Moscow")
 ENCRYPTION_PREFIX = "enc:"
 _FERNET = None
 _POOL = None
+_POOL_LOCK = threading.Lock()
+_POOL_SLOTS = threading.BoundedSemaphore(DB_POOL_MAX_CONN)
 
 
 def now_msk() -> datetime:
@@ -29,21 +33,30 @@ def now_msk() -> datetime:
 
 def get_conn():
     global _POOL
-    if _POOL is None:
-        _POOL = ThreadedConnectionPool(DB_POOL_MIN_CONN, DB_POOL_MAX_CONN, DATABASE_URL, sslmode="require")
-    return _POOL.getconn()
+    if not _POOL_SLOTS.acquire(timeout=10):
+        raise TimeoutError("Database connection pool is busy")
+    try:
+        with _POOL_LOCK:
+            if _POOL is None:
+                _POOL = ThreadedConnectionPool(DB_POOL_MIN_CONN, DB_POOL_MAX_CONN, DATABASE_URL,
+                                               sslmode="require", connect_timeout=10)
+        return _POOL.getconn()
+    except BaseException:
+        _POOL_SLOTS.release()
+        raise
 
 
 def release_conn(conn):
     if conn is None:
         return
     global _POOL
-    if _POOL is None:
-        conn.close()
-        return
-    if conn.closed:
-        return
-    _POOL.putconn(conn)
+    try:
+        if _POOL is None:
+            conn.close()
+        else:
+            _POOL.putconn(conn, close=bool(conn.closed))
+    finally:
+        _POOL_SLOTS.release()
 
 
 def truncate_cached_text(text: str) -> str:
@@ -94,345 +107,355 @@ def init_db():
     if not APP_MASTER_KEY:
         raise RuntimeError("APP_MASTER_KEY is not set")
     conn = get_conn()
-    c = conn.cursor()
+    try:
+        c = conn.cursor()
 
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            user_id         BIGINT PRIMARY KEY,
-            username        TEXT,
-            first_name      TEXT,
-            sub_type        TEXT DEFAULT 'expired',
-            sub_expires     TIMESTAMP,
-            sub_remaining_seconds INTEGER DEFAULT 0,
-            channel_trial_granted BOOLEAN DEFAULT FALSE,
-            created_at      TIMESTAMP DEFAULT NOW()
-        )
-    """)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                user_id         BIGINT PRIMARY KEY,
+                username        TEXT,
+                first_name      TEXT,
+                sub_type        TEXT DEFAULT 'expired',
+                sub_expires     TIMESTAMP,
+                sub_remaining_seconds INTEGER DEFAULT 0,
+                channel_trial_granted BOOLEAN DEFAULT FALSE,
+                created_at      TIMESTAMP DEFAULT NOW()
+            )
+        """)
 
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS connections (
-            connection_id   TEXT PRIMARY KEY,
-            owner_id        BIGINT,
-            is_enabled      INTEGER DEFAULT 1,
-            connected_at    TIMESTAMP DEFAULT NOW()
-        )
-    """)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS connections (
+                connection_id   TEXT PRIMARY KEY,
+                owner_id        BIGINT,
+                is_enabled      INTEGER DEFAULT 1,
+                connected_at    TIMESTAMP DEFAULT NOW()
+            )
+        """)
 
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS message_cache (
-            id              SERIAL PRIMARY KEY,
-            connection_id   TEXT,
-            chat_id         BIGINT,
-            msg_id          BIGINT,
-            sender_name     TEXT,
-            text            TEXT,
-            date            TEXT,
-            created_at      TIMESTAMP DEFAULT NOW(),
-            UNIQUE(connection_id, chat_id, msg_id)
-        )
-    """)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS message_cache (
+                id              SERIAL PRIMARY KEY,
+                connection_id   TEXT,
+                chat_id         BIGINT,
+                msg_id          BIGINT,
+                sender_name     TEXT,
+                text            TEXT,
+                date            TEXT,
+                created_at      TIMESTAMP DEFAULT NOW(),
+                UNIQUE(connection_id, chat_id, msg_id)
+            )
+        """)
 
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS media_cache (
-            id              SERIAL PRIMARY KEY,
-            connection_id   TEXT,
-            chat_id         BIGINT,
-            msg_id          BIGINT,
-            sender_name     TEXT,
-            file_type       TEXT,
-            file_id         TEXT,
-            date            TEXT,
-            created_at      TIMESTAMP DEFAULT NOW(),
-            UNIQUE(connection_id, chat_id, msg_id)
-        )
-    """)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS media_cache (
+                id              SERIAL PRIMARY KEY,
+                connection_id   TEXT,
+                chat_id         BIGINT,
+                msg_id          BIGINT,
+                sender_name     TEXT,
+                file_type       TEXT,
+                file_id         TEXT,
+                date            TEXT,
+                created_at      TIMESTAMP DEFAULT NOW(),
+                UNIQUE(connection_id, chat_id, msg_id)
+            )
+        """)
 
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS referrals (
-            id              SERIAL PRIMARY KEY,
-            referrer_id     BIGINT,
-            referred_id     BIGINT UNIQUE,
-            created_at      TIMESTAMP DEFAULT NOW()
-        )
-    """)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS referrals (
+                id              SERIAL PRIMARY KEY,
+                referrer_id     BIGINT,
+                referred_id     BIGINT UNIQUE,
+                created_at      TIMESTAMP DEFAULT NOW()
+            )
+        """)
 
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS user_settings (
-            user_id         BIGINT PRIMARY KEY,
-            track_deleted   BOOLEAN DEFAULT TRUE,
-            track_edited    BOOLEAN DEFAULT TRUE,
-            support_mode    BOOLEAN DEFAULT FALSE,
-            support_active  BOOLEAN DEFAULT FALSE,
-            updated_at      TIMESTAMP DEFAULT NOW()
-        )
-    """)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS user_settings (
+                user_id         BIGINT PRIMARY KEY,
+                track_deleted   BOOLEAN DEFAULT TRUE,
+                track_edited    BOOLEAN DEFAULT TRUE,
+                support_mode    BOOLEAN DEFAULT FALSE,
+                support_active  BOOLEAN DEFAULT FALSE,
+                updated_at      TIMESTAMP DEFAULT NOW()
+            )
+        """)
 
-    c.execute("""
-        ALTER TABLE user_settings
-        ADD COLUMN IF NOT EXISTS support_mode BOOLEAN DEFAULT FALSE
-    """)
+        c.execute("""
+            ALTER TABLE user_settings
+            ADD COLUMN IF NOT EXISTS support_mode BOOLEAN DEFAULT FALSE
+        """)
 
-    c.execute("""
-        ALTER TABLE user_settings
-        ADD COLUMN IF NOT EXISTS support_active BOOLEAN DEFAULT FALSE
-    """)
+        c.execute("""
+            ALTER TABLE user_settings
+            ADD COLUMN IF NOT EXISTS support_active BOOLEAN DEFAULT FALSE
+        """)
 
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS payments (
-            id                          SERIAL PRIMARY KEY,
-            user_id                     BIGINT NOT NULL,
-            invoice_payload             TEXT NOT NULL,
-            total_amount                BIGINT NOT NULL,
-            currency                    TEXT NOT NULL,
-            telegram_payment_charge_id  TEXT UNIQUE NOT NULL,
-            provider_payment_charge_id  TEXT,
-            refunded                    BOOLEAN DEFAULT FALSE,
-            created_at                  TIMESTAMP DEFAULT NOW(),
-            refunded_at                 TIMESTAMP
-        )
-    """)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS payments (
+                id                          SERIAL PRIMARY KEY,
+                user_id                     BIGINT NOT NULL,
+                invoice_payload             TEXT NOT NULL,
+                total_amount                BIGINT NOT NULL,
+                currency                    TEXT NOT NULL,
+                telegram_payment_charge_id  TEXT UNIQUE NOT NULL,
+                provider_payment_charge_id  TEXT,
+                refunded                    BOOLEAN DEFAULT FALSE,
+                created_at                  TIMESTAMP DEFAULT NOW(),
+                refunded_at                 TIMESTAMP
+            )
+        """)
 
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS locked_messages (
-            token TEXT PRIMARY KEY,
-            user_id BIGINT NOT NULL,
-            payload TEXT NOT NULL,
-            requested_message_id BIGINT,
-            claimed BOOLEAN NOT NULL DEFAULT FALSE,
-            created_at TIMESTAMP NOT NULL DEFAULT NOW()
-        )
-    """)
-    c.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS bot_blocked BOOLEAN NOT NULL DEFAULT FALSE")
-    c.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS bot_status_updated_at BIGINT NOT NULL DEFAULT 0")
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS connection_reminders (
-            user_id BIGINT PRIMARY KEY,
-            next_at BIGINT NOT NULL,
-            attempts INTEGER NOT NULL DEFAULT 0,
-            last_attempt_at BIGINT,
-            opted_out BOOLEAN NOT NULL DEFAULT FALSE
-        )
-    """)
-    c.execute("CREATE INDEX IF NOT EXISTS idx_connection_reminders_due ON connection_reminders (next_at)")
-    c.execute("ALTER TABLE connection_reminders ADD COLUMN IF NOT EXISTS last_attempt_at BIGINT")
-    c.execute("UPDATE connection_reminders SET last_attempt_at = next_at - 129600 WHERE attempts > 0 AND last_attempt_at IS NULL")
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS referral_reminders (
-            user_id BIGINT PRIMARY KEY,
-            observed_expires TIMESTAMP,
-            inactive_since TIMESTAMP,
-            warned_expires TIMESTAMP,
-            last_expired_at TIMESTAMP,
-            last_attempt_at BIGINT
-        )
-    """)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS locked_messages (
+                token TEXT PRIMARY KEY,
+                user_id BIGINT NOT NULL,
+                payload TEXT NOT NULL,
+                requested_message_id BIGINT,
+                claimed BOOLEAN NOT NULL DEFAULT FALSE,
+                claimed_at BIGINT,
+                created_at TIMESTAMP NOT NULL DEFAULT NOW()
+            )
+        """)
+        c.execute("ALTER TABLE locked_messages ADD COLUMN IF NOT EXISTS claimed_at BIGINT")
+        c.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS bot_blocked BOOLEAN NOT NULL DEFAULT FALSE")
+        c.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS bot_status_updated_at BIGINT NOT NULL DEFAULT 0")
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS connection_reminders (
+                user_id BIGINT PRIMARY KEY,
+                next_at BIGINT NOT NULL,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                last_attempt_at BIGINT,
+                opted_out BOOLEAN NOT NULL DEFAULT FALSE
+            )
+        """)
+        c.execute("CREATE INDEX IF NOT EXISTS idx_connection_reminders_due ON connection_reminders (next_at)")
+        c.execute("ALTER TABLE connection_reminders ADD COLUMN IF NOT EXISTS last_attempt_at BIGINT")
+        c.execute("UPDATE connection_reminders SET last_attempt_at = next_at - 129600 WHERE attempts > 0 AND last_attempt_at IS NULL")
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS referral_reminders (
+                user_id BIGINT PRIMARY KEY,
+                observed_expires TIMESTAMP,
+                inactive_since TIMESTAMP,
+                warned_expires TIMESTAMP,
+                last_expired_at TIMESTAMP,
+                last_attempt_at BIGINT
+            )
+        """)
 
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS referral_milestones (
-            user_id BIGINT PRIMARY KEY,
-            prompted BOOLEAN NOT NULL DEFAULT FALSE
-        )
-    """)
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS referral_results (
-            user_id BIGINT NOT NULL,
-            source_key TEXT NOT NULL,
-            PRIMARY KEY (user_id, source_key)
-        )
-    """)
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS ad_campaigns (
-            id SERIAL PRIMARY KEY,
-            code TEXT UNIQUE NOT NULL,
-            name TEXT NOT NULL,
-            cost_rub NUMERIC(12, 2) NOT NULL CHECK (cost_rub >= 0),
-            archived_at TIMESTAMP,
-            created_at TIMESTAMP NOT NULL DEFAULT NOW()
-        )
-    """)
-    c.execute("ALTER TABLE ad_campaigns ADD COLUMN IF NOT EXISTS archived_at TIMESTAMP")
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS ad_visits (
-            campaign_id INTEGER NOT NULL REFERENCES ad_campaigns(id),
-            user_id BIGINT NOT NULL,
-            first_seen TIMESTAMP NOT NULL DEFAULT NOW(),
-            PRIMARY KEY (campaign_id, user_id)
-        )
-    """)
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS ad_acquisitions (
-            user_id BIGINT PRIMARY KEY,
-            campaign_id INTEGER NOT NULL REFERENCES ad_campaigns(id),
-            acquired_at TIMESTAMP NOT NULL DEFAULT NOW(),
-            attribution_method TEXT NOT NULL DEFAULT 'link',
-            connected_at TIMESTAMP
-        )
-    """)
-    c.execute("ALTER TABLE ad_acquisitions ADD COLUMN IF NOT EXISTS attribution_method TEXT NOT NULL DEFAULT 'link'")
-    c.execute("CREATE INDEX IF NOT EXISTS idx_ad_acquisitions_campaign ON ad_acquisitions (campaign_id)")
-    c.execute("CREATE INDEX IF NOT EXISTS idx_locked_messages_user ON locked_messages (user_id)")
-    c.execute("CREATE INDEX IF NOT EXISTS idx_locked_messages_created ON locked_messages (created_at)")
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS support_message_links (
-            admin_message_id    BIGINT PRIMARY KEY,
-            user_id             BIGINT NOT NULL,
-            created_at          TIMESTAMP DEFAULT NOW()
-        )
-    """)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS referral_milestones (
+                user_id BIGINT PRIMARY KEY,
+                prompted BOOLEAN NOT NULL DEFAULT FALSE
+            )
+        """)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS referral_results (
+                user_id BIGINT NOT NULL,
+                source_key TEXT NOT NULL,
+                PRIMARY KEY (user_id, source_key)
+            )
+        """)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS ad_campaigns (
+                id SERIAL PRIMARY KEY,
+                code TEXT UNIQUE NOT NULL,
+                name TEXT NOT NULL,
+                cost_rub NUMERIC(12, 2) NOT NULL CHECK (cost_rub >= 0),
+                archived_at TIMESTAMP,
+                created_at TIMESTAMP NOT NULL DEFAULT NOW()
+            )
+        """)
+        c.execute("ALTER TABLE ad_campaigns ADD COLUMN IF NOT EXISTS archived_at TIMESTAMP")
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS ad_visits (
+                campaign_id INTEGER NOT NULL REFERENCES ad_campaigns(id),
+                user_id BIGINT NOT NULL,
+                first_seen TIMESTAMP NOT NULL DEFAULT NOW(),
+                PRIMARY KEY (campaign_id, user_id)
+            )
+        """)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS ad_acquisitions (
+                user_id BIGINT PRIMARY KEY,
+                campaign_id INTEGER NOT NULL REFERENCES ad_campaigns(id),
+                acquired_at TIMESTAMP NOT NULL DEFAULT NOW(),
+                attribution_method TEXT NOT NULL DEFAULT 'link',
+                connected_at TIMESTAMP
+            )
+        """)
+        c.execute("ALTER TABLE ad_acquisitions ADD COLUMN IF NOT EXISTS attribution_method TEXT NOT NULL DEFAULT 'link'")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_ad_acquisitions_campaign ON ad_acquisitions (campaign_id)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_locked_messages_user ON locked_messages (user_id)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_locked_messages_created ON locked_messages (created_at)")
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS support_message_links (
+                admin_message_id    BIGINT PRIMARY KEY,
+                user_id             BIGINT NOT NULL,
+                created_at          TIMESTAMP DEFAULT NOW()
+            )
+        """)
 
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS tribute_payments (
-            purchase_id     TEXT PRIMARY KEY,
-            transaction_id  TEXT,
-            user_id         BIGINT NOT NULL,
-            product_id      TEXT NOT NULL,
-            amount          BIGINT NOT NULL,
-            currency        TEXT NOT NULL,
-            granted_days    INTEGER NOT NULL,
-            refunded        BOOLEAN DEFAULT FALSE,
-            created_at      TIMESTAMP DEFAULT NOW(),
-            refunded_at     TIMESTAMP
-        )
-    """)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS tribute_payments (
+                purchase_id     TEXT PRIMARY KEY,
+                transaction_id  TEXT,
+                user_id         BIGINT NOT NULL,
+                product_id      TEXT NOT NULL,
+                amount          BIGINT NOT NULL,
+                currency        TEXT NOT NULL,
+                granted_days    INTEGER NOT NULL,
+                refunded        BOOLEAN DEFAULT FALSE,
+                created_at      TIMESTAMP DEFAULT NOW(),
+                refunded_at     TIMESTAMP
+            )
+        """)
 
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS platega_payments (
-            transaction_id  TEXT PRIMARY KEY,
-            user_id         BIGINT NOT NULL,
-            plan_id         TEXT NOT NULL,
-            amount          INTEGER NOT NULL,
-            currency        TEXT NOT NULL,
-            granted_days    INTEGER NOT NULL,
-            payment_method  INTEGER,
-            status          TEXT NOT NULL DEFAULT 'PENDING',
-            refunded        BOOLEAN NOT NULL DEFAULT FALSE,
-            created_at      TIMESTAMP DEFAULT NOW(),
-            confirmed_at    TIMESTAMP,
-            refunded_at     TIMESTAMP
-        )
-    """)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS platega_payments (
+                transaction_id  TEXT PRIMARY KEY,
+                user_id         BIGINT NOT NULL,
+                plan_id         TEXT NOT NULL,
+                amount          INTEGER NOT NULL,
+                currency        TEXT NOT NULL,
+                granted_days    INTEGER NOT NULL,
+                payment_method  INTEGER,
+                status          TEXT NOT NULL DEFAULT 'PENDING',
+                refunded        BOOLEAN NOT NULL DEFAULT FALSE,
+                created_at      TIMESTAMP DEFAULT NOW(),
+                confirmed_at    TIMESTAMP,
+                refunded_at     TIMESTAMP
+            )
+        """)
 
-    c.execute("""
-        ALTER TABLE users
-        ADD COLUMN IF NOT EXISTS sub_remaining_seconds INTEGER DEFAULT 0
-    """)
-    c.execute("""
-        ALTER TABLE users
-        ADD COLUMN IF NOT EXISTS channel_trial_granted BOOLEAN DEFAULT FALSE
-    """)
-    c.execute("""
-        ALTER TABLE referrals
-        ADD COLUMN IF NOT EXISTS rewarded BOOLEAN DEFAULT TRUE
-    """)
-    c.execute("""
-        ALTER TABLE message_cache
-        ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT NOW()
-    """)
-    c.execute("""
-        ALTER TABLE media_cache
-        ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT NOW()
-    """)
-    c.execute("""
-        UPDATE message_cache
-        SET created_at = COALESCE(created_at, to_timestamp(date, 'DD.MM.YYYY HH24:MI'), NOW())
-    """)
-    c.execute("""
-        UPDATE media_cache
-        SET created_at = COALESCE(created_at, to_timestamp(date, 'DD.MM.YYYY HH24:MI'), NOW())
-    """)
-
-    c.execute("CREATE INDEX IF NOT EXISTS idx_users_username ON users (username)")
-    c.execute("CREATE INDEX IF NOT EXISTS idx_users_sub_type ON users (sub_type)")
-    c.execute("CREATE INDEX IF NOT EXISTS idx_users_created_at ON users (created_at DESC)")
-    c.execute("CREATE INDEX IF NOT EXISTS idx_connections_owner_enabled ON connections (owner_id, is_enabled)")
-    c.execute("CREATE INDEX IF NOT EXISTS idx_connections_enabled ON connections (is_enabled)")
-    c.execute("CREATE INDEX IF NOT EXISTS idx_referrals_referrer ON referrals (referrer_id)")
-    c.execute("CREATE INDEX IF NOT EXISTS idx_referrals_referred ON referrals (referred_id)")
-    c.execute("CREATE INDEX IF NOT EXISTS idx_user_settings_active ON user_settings (support_active)")
-    c.execute("CREATE INDEX IF NOT EXISTS idx_payments_user_id ON payments (user_id)")
-    c.execute("CREATE INDEX IF NOT EXISTS idx_payments_charge_id ON payments (telegram_payment_charge_id)")
-    c.execute("CREATE INDEX IF NOT EXISTS idx_support_links_user_id ON support_message_links (user_id)")
-    c.execute("CREATE INDEX IF NOT EXISTS idx_message_cache_lookup ON message_cache (connection_id, chat_id, msg_id)")
-    c.execute("CREATE INDEX IF NOT EXISTS idx_media_cache_lookup ON media_cache (connection_id, chat_id, msg_id)")
-    c.execute("CREATE INDEX IF NOT EXISTS idx_message_cache_date ON message_cache (date)")
-    c.execute("CREATE INDEX IF NOT EXISTS idx_media_cache_date ON media_cache (date)")
-    c.execute("CREATE INDEX IF NOT EXISTS idx_message_cache_created_at ON message_cache (created_at)")
-    c.execute("CREATE INDEX IF NOT EXISTS idx_media_cache_created_at ON media_cache (created_at)")
-    c.execute("CREATE INDEX IF NOT EXISTS idx_support_links_created_at ON support_message_links (created_at)")
-    c.execute("CREATE INDEX IF NOT EXISTS idx_tribute_payments_user_id ON tribute_payments (user_id)")
-    c.execute("CREATE INDEX IF NOT EXISTS idx_platega_payments_user_id ON platega_payments (user_id)")
-    c.execute("CREATE INDEX IF NOT EXISTS idx_platega_payments_status ON platega_payments (status)")
-
-    c.execute("""
-        UPDATE users
-        SET sub_remaining_seconds = GREATEST(
-                COALESCE(sub_remaining_seconds, 0),
-                GREATEST(0, EXTRACT(EPOCH FROM (sub_expires - NOW()))::INT)
-            ),
-            sub_expires = NULL
-        WHERE sub_expires IS NOT NULL
-          AND NOT EXISTS (
-              SELECT 1
-              FROM connections c
-              WHERE c.owner_id = users.user_id AND c.is_enabled = 1
-          )
-    """)
-
-    c.execute("""
-        SELECT id, sender_name, text
-        FROM message_cache
-        WHERE text IS NOT NULL AND text NOT LIKE %s
-    """, (ENCRYPTION_PREFIX + "%",))
-    rows = c.fetchall()
-    for row_id, sender_name, text in rows:
+        c.execute("""
+            ALTER TABLE users
+            ADD COLUMN IF NOT EXISTS sub_remaining_seconds INTEGER DEFAULT 0
+        """)
+        c.execute("""
+            ALTER TABLE users
+            ADD COLUMN IF NOT EXISTS channel_trial_granted BOOLEAN DEFAULT FALSE
+        """)
+        c.execute("""
+            ALTER TABLE referrals
+            ADD COLUMN IF NOT EXISTS rewarded BOOLEAN DEFAULT TRUE
+        """)
+        c.execute("""
+            ALTER TABLE message_cache
+            ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT NOW()
+        """)
+        c.execute("""
+            ALTER TABLE media_cache
+            ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT NOW()
+        """)
         c.execute("""
             UPDATE message_cache
-            SET sender_name = %s,
-                text = %s
-            WHERE id = %s
-        """, (encrypt_value(sender_name), encrypt_value(text), row_id))
-
-    c.execute("""
-        SELECT id, sender_name, file_id
-        FROM media_cache
-        WHERE file_id IS NOT NULL AND file_id NOT LIKE %s
-    """, (ENCRYPTION_PREFIX + "%",))
-    rows = c.fetchall()
-    for row_id, sender_name, file_id in rows:
+            SET created_at = COALESCE(created_at, to_timestamp(date, 'DD.MM.YYYY HH24:MI'), NOW())
+            WHERE created_at IS NULL
+        """)
         c.execute("""
             UPDATE media_cache
-            SET sender_name = %s,
-                file_id = %s
-            WHERE id = %s
-        """, (encrypt_value(sender_name), encrypt_value(file_id), row_id))
+            SET created_at = COALESCE(created_at, to_timestamp(date, 'DD.MM.YYYY HH24:MI'), NOW())
+            WHERE created_at IS NULL
+        """)
 
-    conn.commit()
-    release_conn(conn)
+        c.execute("CREATE INDEX IF NOT EXISTS idx_users_username ON users (username)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_users_sub_type ON users (sub_type)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_users_created_at ON users (created_at DESC)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_connections_owner_enabled ON connections (owner_id, is_enabled)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_connections_enabled ON connections (is_enabled)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_referrals_referrer ON referrals (referrer_id)")
+        c.execute("DROP INDEX IF EXISTS idx_referrals_referred")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_user_settings_active ON user_settings (support_active)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_payments_user_id ON payments (user_id)")
+        c.execute("DROP INDEX IF EXISTS idx_payments_charge_id")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_support_links_user_id ON support_message_links (user_id)")
+        c.execute("DROP INDEX IF EXISTS idx_message_cache_lookup")
+        c.execute("DROP INDEX IF EXISTS idx_media_cache_lookup")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_message_cache_date ON message_cache (date)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_media_cache_date ON media_cache (date)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_message_cache_created_at ON message_cache (created_at)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_media_cache_created_at ON media_cache (created_at)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_support_links_created_at ON support_message_links (created_at)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_tribute_payments_user_id ON tribute_payments (user_id)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_platega_payments_user_id ON platega_payments (user_id)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_platega_payments_status ON platega_payments (status)")
+
+        c.execute("""
+            UPDATE users
+            SET sub_remaining_seconds = GREATEST(
+                    COALESCE(sub_remaining_seconds, 0),
+                    GREATEST(0, EXTRACT(EPOCH FROM (sub_expires - timezone('Europe/Moscow', NOW())))::INT)
+                ),
+                sub_expires = NULL
+            WHERE sub_expires IS NOT NULL
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM connections c
+                  WHERE c.owner_id = users.user_id AND c.is_enabled = 1
+              )
+        """)
+
+        c.execute("""
+            SELECT id, sender_name, text
+            FROM message_cache
+            WHERE text IS NOT NULL AND text NOT LIKE %s
+        """, (ENCRYPTION_PREFIX + "%",))
+        rows = c.fetchall()
+        for row_id, sender_name, text in rows:
+            c.execute("""
+                UPDATE message_cache
+                SET sender_name = %s,
+                    text = %s
+                WHERE id = %s
+            """, (encrypt_value(sender_name), encrypt_value(text), row_id))
+
+        c.execute("""
+            SELECT id, sender_name, file_id
+            FROM media_cache
+            WHERE file_id IS NOT NULL AND file_id NOT LIKE %s
+        """, (ENCRYPTION_PREFIX + "%",))
+        rows = c.fetchall()
+        for row_id, sender_name, file_id in rows:
+            c.execute("""
+                UPDATE media_cache
+                SET sender_name = %s,
+                    file_id = %s
+                WHERE id = %s
+            """, (encrypt_value(sender_name), encrypt_value(file_id), row_id))
+
+        conn.commit()
+    finally:
+        release_conn(conn)
 
 
 # в”Ђв”Ђ РџРѕР»СЊР·РѕРІР°С‚РµР»Рё в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
 
 def save_user(user_id: int, username: str, first_name: str = ""):
     conn = get_conn()
-    c = conn.cursor()
-    c.execute("""
-        INSERT INTO users (user_id, username, first_name, sub_type, sub_expires, sub_remaining_seconds)
-        VALUES (%s, %s, %s, 'expired', NULL, 0)
-        ON CONFLICT(user_id) DO UPDATE SET
-            username = EXCLUDED.username,
-            first_name = EXCLUDED.first_name
-    """, (user_id, username or "", first_name or ""))
-    conn.commit()
-    release_conn(conn)
+    try:
+        c = conn.cursor()
+        c.execute("""
+            INSERT INTO users (user_id, username, first_name, sub_type, sub_expires, sub_remaining_seconds)
+            VALUES (%s, %s, %s, 'expired', NULL, 0)
+            ON CONFLICT(user_id) DO UPDATE SET
+                username = EXCLUDED.username,
+                first_name = EXCLUDED.first_name
+        """, (user_id, username or "", first_name or ""))
+        conn.commit()
+    finally:
+        release_conn(conn)
 
 
 def get_user(user_id: int):
     conn = get_conn()
-    c = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-    c.execute("SELECT * FROM users WHERE user_id = %s", (user_id,))
-    row = c.fetchone()
-    release_conn(conn)
-    return dict(row) if row else None
+    try:
+        c = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        c.execute("SELECT * FROM users WHERE user_id = %s", (user_id,))
+        row = c.fetchone()
+        return dict(row) if row else None
+    finally:
+        release_conn(conn)
 
 
 def set_bot_blocked(user_id, blocked, event_at):
@@ -709,273 +732,235 @@ def referral_reminder_allowed(user_id, kind, expected_expires, now_ts):
 
 def get_all_users():
     conn = get_conn()
-    c = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-    c.execute("SELECT * FROM users ORDER BY created_at DESC")
-    rows = c.fetchall()
-    release_conn(conn)
-    return [dict(r) for r in rows]
+    try:
+        c = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        c.execute("""
+            SELECT u.*, COALESCE(c.connection_count, 0) AS connection_count,
+                   COALESCE(r.referral_count, 0) AS referral_count
+            FROM users u
+            LEFT JOIN (SELECT owner_id, COUNT(*) AS connection_count FROM connections
+                       WHERE is_enabled = 1 GROUP BY owner_id) c ON c.owner_id = u.user_id
+            LEFT JOIN (SELECT referrer_id, COUNT(*) AS referral_count FROM referrals
+                       WHERE rewarded = TRUE GROUP BY referrer_id) r ON r.referrer_id = u.user_id
+            ORDER BY u.created_at DESC
+        """)
+        rows = c.fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        release_conn(conn)
 
 
 def get_users_with_active_support():
     conn = get_conn()
-    c = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-    c.execute("""
-        SELECT u.user_id, u.username, u.first_name, us.updated_at
-        FROM user_settings us
-        LEFT JOIN users u ON u.user_id = us.user_id
-        WHERE us.support_active = TRUE
-        ORDER BY us.updated_at DESC
-    """)
-    rows = c.fetchall()
-    release_conn(conn)
-    return [dict(r) for r in rows]
+    try:
+        c = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        c.execute("""
+            SELECT u.user_id, u.username, u.first_name, us.updated_at
+            FROM user_settings us
+            LEFT JOIN users u ON u.user_id = us.user_id
+            WHERE us.support_active = TRUE
+            ORDER BY us.updated_at DESC
+        """)
+        rows = c.fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        release_conn(conn)
 
 
 def set_subscription(user_id: int, sub_type: str, days: int):
     conn = get_conn()
-    c = conn.cursor()
-    c.execute("SELECT COUNT(*) FROM connections WHERE owner_id = %s AND is_enabled = 1", (user_id,))
-    active_connections = c.fetchone()[0]
-    remaining_seconds = max(0, int(days * 24 * 60 * 60))
-    if days <= 0:
-        c.execute("""
-            UPDATE users
-            SET sub_type = %s,
-                sub_expires = NULL,
-                sub_remaining_seconds = 0
-            WHERE user_id = %s
-        """, (sub_type, user_id))
+    try:
+        c = conn.cursor()
+        c.execute("SELECT user_id FROM users WHERE user_id = %s FOR UPDATE", (user_id,))
+        c.execute("SELECT COUNT(*) FROM connections WHERE owner_id = %s AND is_enabled = 1", (user_id,))
+        active_connections = c.fetchone()[0]
+        remaining_seconds = max(0, int(days * 24 * 60 * 60))
+        if days <= 0:
+            c.execute("""
+                UPDATE users
+                SET sub_type = %s,
+                    sub_expires = NULL,
+                    sub_remaining_seconds = 0
+                WHERE user_id = %s
+            """, (sub_type, user_id))
+            conn.commit()
+            return
+        if active_connections:
+            c.execute("""
+                UPDATE users
+                SET sub_type = %s,
+                    sub_expires = GREATEST(
+                        COALESCE(sub_expires, %s),
+                        %s
+                    ) + (%s * INTERVAL '1 day'),
+                    sub_remaining_seconds = 0
+                WHERE user_id = %s
+            """, (sub_type, now_msk(), now_msk(), days, user_id))
+        else:
+            c.execute("""
+                UPDATE users
+                SET sub_type = %s,
+                    sub_expires = NULL,
+                    sub_remaining_seconds = COALESCE(sub_remaining_seconds, 0) + %s
+                WHERE user_id = %s
+            """, (sub_type, remaining_seconds, user_id))
         conn.commit()
+    finally:
         release_conn(conn)
-        return
-    if active_connections:
-        c.execute("""
-            UPDATE users
-            SET sub_type = %s,
-                sub_expires = GREATEST(
-                    COALESCE(sub_expires, %s),
-                    %s
-                ) + (%s * INTERVAL '1 day'),
-                sub_remaining_seconds = 0
-            WHERE user_id = %s
-        """, (sub_type, now_msk(), now_msk(), days, user_id))
-    else:
-        c.execute("""
-            UPDATE users
-            SET sub_type = %s,
-                sub_expires = NULL,
-                sub_remaining_seconds = COALESCE(sub_remaining_seconds, 0) + %s
-            WHERE user_id = %s
-        """, (sub_type, remaining_seconds, user_id))
-    conn.commit()
-    release_conn(conn)
 
 
 def grant_channel_trial_once(user_id: int, days: int = 7) -> bool:
     conn = get_conn()
-    c = conn.cursor()
-    c.execute("""
-        SELECT sub_type, sub_expires, sub_remaining_seconds, channel_trial_granted
-        FROM users
-        WHERE user_id = %s
-        FOR UPDATE
-    """, (user_id,))
-    user = c.fetchone()
-    if not user:
+    try:
+        c = conn.cursor()
         c.execute("""
-            INSERT INTO users (
-                user_id, sub_type, sub_expires, sub_remaining_seconds, channel_trial_granted
-            )
-            VALUES (%s, 'expired', NULL, 0, FALSE)
+            SELECT sub_type, sub_expires, sub_remaining_seconds, channel_trial_granted
+            FROM users
+            WHERE user_id = %s
+            FOR UPDATE
         """, (user_id,))
-        user = {
-            "sub_type": "expired",
-            "sub_expires": None,
-            "sub_remaining_seconds": 0,
-            "channel_trial_granted": False,
-        }
+        user = c.fetchone()
+        if not user:
+            c.execute("""
+                INSERT INTO users (
+                    user_id, sub_type, sub_expires, sub_remaining_seconds, channel_trial_granted
+                )
+                VALUES (%s, 'expired', NULL, 0, FALSE)
+            """, (user_id,))
+            user = {
+                "sub_type": "expired",
+                "sub_expires": None,
+                "sub_remaining_seconds": 0,
+                "channel_trial_granted": False,
+            }
 
-    if isinstance(user, dict):
-        sub_type = user.get("sub_type")
-        expires = user.get("sub_expires")
-        trial_granted = user.get("channel_trial_granted")
-    else:
-        sub_type, expires, _remaining_seconds, trial_granted = user
+        if isinstance(user, dict):
+            sub_type = user.get("sub_type")
+            expires = user.get("sub_expires")
+            trial_granted = user.get("channel_trial_granted")
+        else:
+            sub_type, expires, _remaining_seconds, trial_granted = user
 
-    if trial_granted or sub_type == "banned":
+        if trial_granted or sub_type == "banned":
+            conn.commit()
+            return False
+
+        c.execute("SELECT COUNT(*) FROM connections WHERE owner_id = %s AND is_enabled = 1", (user_id,))
+        active_connections = c.fetchone()[0]
+        remaining_seconds = max(0, int(days * 24 * 60 * 60))
+        has_active_subscription = False
+        if active_connections and expires:
+            if isinstance(expires, str):
+                expires = datetime.strptime(expires[:19], "%Y-%m-%d %H:%M:%S")
+            has_active_subscription = now_msk() < expires
+
+        if has_active_subscription:
+            c.execute("""
+                UPDATE users
+                SET channel_trial_granted = TRUE
+                WHERE user_id = %s
+            """, (user_id,))
+        elif active_connections:
+            c.execute("""
+                UPDATE users
+                SET sub_type = 'trial',
+                    sub_expires = %s,
+                    sub_remaining_seconds = 0,
+                    channel_trial_granted = TRUE
+                WHERE user_id = %s
+            """, (now_msk() + timedelta(days=days), user_id))
+        else:
+            c.execute("""
+                UPDATE users
+                SET sub_type = 'trial',
+                    sub_expires = NULL,
+                    sub_remaining_seconds = GREATEST(COALESCE(sub_remaining_seconds, 0), %s),
+                    channel_trial_granted = TRUE
+                WHERE user_id = %s
+            """, (remaining_seconds, user_id))
+
         conn.commit()
+        return not has_active_subscription
+    finally:
         release_conn(conn)
-        return False
-
-    c.execute("SELECT COUNT(*) FROM connections WHERE owner_id = %s AND is_enabled = 1", (user_id,))
-    active_connections = c.fetchone()[0]
-    remaining_seconds = max(0, int(days * 24 * 60 * 60))
-    has_active_subscription = False
-    if active_connections and expires:
-        if isinstance(expires, str):
-            expires = datetime.strptime(expires[:19], "%Y-%m-%d %H:%M:%S")
-        has_active_subscription = now_msk() < expires
-
-    if has_active_subscription:
-        c.execute("""
-            UPDATE users
-            SET channel_trial_granted = TRUE
-            WHERE user_id = %s
-        """, (user_id,))
-    elif active_connections:
-        c.execute("""
-            UPDATE users
-            SET sub_type = 'trial',
-                sub_expires = %s,
-                sub_remaining_seconds = 0,
-                channel_trial_granted = TRUE
-            WHERE user_id = %s
-        """, (now_msk() + timedelta(days=days), user_id))
-    else:
-        c.execute("""
-            UPDATE users
-            SET sub_type = 'trial',
-                sub_expires = NULL,
-                sub_remaining_seconds = GREATEST(COALESCE(sub_remaining_seconds, 0), %s),
-                channel_trial_granted = TRUE
-            WHERE user_id = %s
-        """, (remaining_seconds, user_id))
-
-    conn.commit()
-    release_conn(conn)
-    return not has_active_subscription
 
 
-def add_days(user_id: int, days: int):
-    """Р”РѕР±Р°РІРёС‚СЊ РґРЅРё Рє С‚РµРєСѓС‰РµР№ РїРѕРґРїРёСЃРєРµ"""
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute("SELECT COUNT(*) FROM connections WHERE owner_id = %s AND is_enabled = 1", (user_id,))
-    active_connections = c.fetchone()[0]
-    if active_connections:
-        c.execute("""
-            UPDATE users SET
-                sub_expires = GREATEST(
-                    COALESCE(sub_expires, timezone('Europe/Moscow', NOW())),
-                    timezone('Europe/Moscow', NOW())
-                ) + (%s || ' days')::INTERVAL
-            WHERE user_id = %s AND sub_type != 'banned'
-        """, (str(days), user_id))
-    else:
-        c.execute("""
-            UPDATE users SET
-                sub_remaining_seconds = COALESCE(sub_remaining_seconds, 0) + (%s * 86400)
-            WHERE user_id = %s AND sub_type != 'banned'
-        """, (days, user_id))
-    conn.commit()
-    release_conn(conn)
 
 
 def is_sub_active(user_id: int) -> bool:
     user = get_user(user_id)
     if not user:
-        return True  # РЅРѕРІС‹Р№ РїРѕР»СЊР·РѕРІР°С‚РµР»СЊ вЂ” СЂР°Р·СЂРµС€Р°РµРј
+        return False
     if user["sub_type"] == "banned":
         return False
     conn = get_conn()
-    c = conn.cursor()
-    c.execute("SELECT COUNT(*) FROM connections WHERE owner_id = %s AND is_enabled = 1", (user_id,))
-    active_connections = c.fetchone()[0]
-    release_conn(conn)
-    if not active_connections:
-        return False
-    if not user["sub_expires"]:
-        return False
-    expires = user["sub_expires"]
-    if isinstance(expires, str):
-        expires = datetime.strptime(expires[:19], "%Y-%m-%d %H:%M:%S")
-    return now_msk() < expires
+    try:
+        c = conn.cursor()
+        c.execute("SELECT COUNT(*) FROM connections WHERE owner_id = %s AND is_enabled = 1", (user_id,))
+        active_connections = c.fetchone()[0]
+        if not active_connections:
+            return False
+        if not user["sub_expires"]:
+            return False
+        expires = user["sub_expires"]
+        if isinstance(expires, str):
+            expires = datetime.strptime(expires[:19], "%Y-%m-%d %H:%M:%S")
+        return now_msk() < expires
+    finally:
+        release_conn(conn)
 
 
-def pause_subscription(user_id: int):
-    user = get_user(user_id)
-    if not user or user.get("sub_type") == "banned":
-        return
-    if not user.get("sub_expires"):
-        return
-    expires = user["sub_expires"]
-    if isinstance(expires, str):
-        expires = datetime.strptime(expires[:19], "%Y-%m-%d %H:%M:%S")
-    remaining_seconds = max(0, int((expires - now_msk()).total_seconds()))
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute("""
-        UPDATE users
-        SET sub_remaining_seconds = %s,
-            sub_expires = NULL
-        WHERE user_id = %s
-    """, (remaining_seconds, user_id))
-    conn.commit()
-    release_conn(conn)
 
 
-def resume_subscription(user_id: int):
-    user = get_user(user_id)
-    if not user or user.get("sub_type") == "banned":
-        return
-    remaining_seconds = int(user.get("sub_remaining_seconds") or 0)
-    if remaining_seconds <= 0:
-        return
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute("""
-        UPDATE users
-        SET sub_expires = %s,
-            sub_remaining_seconds = 0
-        WHERE user_id = %s
-    """, (now_msk() + timedelta(seconds=remaining_seconds), user_id))
-    conn.commit()
-    release_conn(conn)
 
 
 def cleanup_temp_tables():
     conn = get_conn()
-    c = conn.cursor()
-    c.execute("DELETE FROM locked_messages WHERE created_at < NOW() - INTERVAL '14 days'")
-    c.execute("""
-        DELETE FROM message_cache
-        WHERE created_at < NOW() - INTERVAL '14 days'
-    """)
-    c.execute("""
-        DELETE FROM media_cache
-        WHERE created_at < NOW() - INTERVAL '14 days'
-    """)
-    c.execute("""
-        DELETE FROM support_message_links
-        WHERE created_at < NOW() - INTERVAL '7 days'
-    """)
-    conn.commit()
-    release_conn(conn)
+    try:
+        c = conn.cursor()
+        c.execute("DELETE FROM locked_messages WHERE created_at < NOW() - INTERVAL '14 days'")
+        c.execute("""
+            DELETE FROM message_cache
+            WHERE created_at < NOW() - INTERVAL '14 days'
+        """)
+        c.execute("""
+            DELETE FROM media_cache
+            WHERE created_at < NOW() - INTERVAL '14 days'
+        """)
+        c.execute("""
+            DELETE FROM support_message_links
+            WHERE created_at < NOW() - INTERVAL '7 days'
+        """)
+        conn.commit()
+    finally:
+        release_conn(conn)
 
 
 def get_user_settings(user_id: int):
     conn = get_conn()
-    c = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-    c.execute("""
-        INSERT INTO user_settings (user_id)
-        VALUES (%s)
-        ON CONFLICT (user_id) DO NOTHING
-    """, (user_id,))
-    c.execute("""
-        SELECT track_deleted, track_edited, support_mode
-             , support_active
-        FROM user_settings
-        WHERE user_id = %s
-    """, (user_id,))
-    row = c.fetchone()
-    conn.commit()
-    release_conn(conn)
-    return dict(row) if row else {
-        "track_deleted": True,
-        "track_edited": True,
-        "support_mode": False,
-        "support_active": False,
-    }
+    try:
+        c = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        c.execute("""
+            INSERT INTO user_settings (user_id)
+            VALUES (%s)
+            ON CONFLICT (user_id) DO NOTHING
+        """, (user_id,))
+        c.execute("""
+            SELECT track_deleted, track_edited, support_mode
+                 , support_active
+            FROM user_settings
+            WHERE user_id = %s
+        """, (user_id,))
+        row = c.fetchone()
+        conn.commit()
+        return dict(row) if row else {
+            "track_deleted": True,
+            "track_edited": True,
+            "support_mode": False,
+            "support_active": False,
+        }
+    finally:
+        release_conn(conn)
 
 
 def save_user_settings(
@@ -986,55 +971,25 @@ def save_user_settings(
     support_active: bool = False,
 ):
     conn = get_conn()
-    c = conn.cursor()
-    c.execute("""
-        INSERT INTO user_settings (
-            user_id, track_deleted, track_edited, support_mode, support_active, updated_at
-        )
-        VALUES (%s, %s, %s, %s, %s, NOW())
-        ON CONFLICT (user_id) DO UPDATE SET
-            track_deleted = EXCLUDED.track_deleted,
-            track_edited = EXCLUDED.track_edited,
-            support_mode = EXCLUDED.support_mode,
-            support_active = EXCLUDED.support_active,
-            updated_at = NOW()
-    """, (user_id, track_deleted, track_edited, support_mode, support_active))
-    conn.commit()
-    release_conn(conn)
+    try:
+        c = conn.cursor()
+        c.execute("""
+            INSERT INTO user_settings (
+                user_id, track_deleted, track_edited, support_mode, support_active, updated_at
+            )
+            VALUES (%s, %s, %s, %s, %s, NOW())
+            ON CONFLICT (user_id) DO UPDATE SET
+                track_deleted = EXCLUDED.track_deleted,
+                track_edited = EXCLUDED.track_edited,
+                support_mode = EXCLUDED.support_mode,
+                support_active = EXCLUDED.support_active,
+                updated_at = NOW()
+        """, (user_id, track_deleted, track_edited, support_mode, support_active))
+        conn.commit()
+    finally:
+        release_conn(conn)
 
 
-def save_payment(
-    user_id: int,
-    invoice_payload: str,
-    total_amount: int,
-    currency: str,
-    telegram_payment_charge_id: str,
-    provider_payment_charge_id: str = "",
-):
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute("""
-        INSERT INTO payments (
-            user_id, invoice_payload, total_amount, currency,
-            telegram_payment_charge_id, provider_payment_charge_id
-        )
-        VALUES (%s, %s, %s, %s, %s, %s)
-        ON CONFLICT (telegram_payment_charge_id) DO UPDATE SET
-            user_id = EXCLUDED.user_id,
-            invoice_payload = EXCLUDED.invoice_payload,
-            total_amount = EXCLUDED.total_amount,
-            currency = EXCLUDED.currency,
-            provider_payment_charge_id = EXCLUDED.provider_payment_charge_id
-    """, (
-        user_id,
-        invoice_payload,
-        total_amount,
-        currency,
-        telegram_payment_charge_id,
-        provider_payment_charge_id or "",
-    ))
-    conn.commit()
-    release_conn(conn)
 
 
 def apply_stars_purchase(
@@ -1050,8 +1005,8 @@ def apply_stars_purchase(
 ) -> bool:
     """Record a Stars payment and grant its days exactly once."""
     conn = get_conn()
-    c = conn.cursor()
     try:
+        c = conn.cursor()
         c.execute("""
             INSERT INTO payments (
                 user_id, invoice_payload, total_amount, currency,
@@ -1082,6 +1037,7 @@ def apply_stars_purchase(
                 username = EXCLUDED.username,
                 first_name = EXCLUDED.first_name
         """, (user_id, username or "", first_name or "", invoice_payload))
+        c.execute("SELECT user_id FROM users WHERE user_id = %s FOR UPDATE", (user_id,))
         c.execute(
             "SELECT COUNT(*) FROM connections WHERE owner_id = %s AND is_enabled = 1",
             (user_id,),
@@ -1160,26 +1116,44 @@ def get_requested_locked_messages(user_id: int):
             with conn.cursor() as c:
                 c.execute("""
                     SELECT token, requested_message_id FROM locked_messages
-                    WHERE user_id = %s AND requested_message_id IS NOT NULL AND claimed = FALSE
+                    WHERE user_id = %s AND requested_message_id IS NOT NULL
+                      AND (claimed = FALSE OR COALESCE(claimed_at, 0) <= %s)
                       AND created_at >= NOW() - INTERVAL '14 days'
                     ORDER BY created_at
-                """, (user_id,))
+                """, (user_id, int(time.time()) - 900))
                 return c.fetchall()
     finally:
         release_conn(conn)
 
 
-def claim_locked_message(token: str, user_id: int) -> bool:
+def claim_locked_message(token: str, user_id: int, allow_stale: bool = False) -> bool:
     conn = get_conn()
     try:
         with conn:
             with conn.cursor() as c:
                 c.execute("""
-                    UPDATE locked_messages SET claimed = TRUE
-                    WHERE token = %s AND user_id = %s AND claimed = FALSE
+                    UPDATE locked_messages SET claimed = TRUE, claimed_at = %s
+                    WHERE token = %s AND user_id = %s
+                      AND (claimed = FALSE OR (%s AND COALESCE(claimed_at, 0) <= %s))
                       AND created_at >= NOW() - INTERVAL '14 days'
                     RETURNING token
-                """, (token, user_id))
+                """, (int(time.time()), token, user_id, allow_stale, int(time.time()) - 900))
+                return c.fetchone() is not None
+    finally:
+        release_conn(conn)
+
+
+def locked_message_retry_available(token: str, user_id: int) -> bool:
+    conn = get_conn()
+    try:
+        with conn:
+            with conn.cursor() as c:
+                c.execute("""
+                    SELECT token FROM locked_messages
+                    WHERE token = %s AND user_id = %s AND claimed = TRUE
+                      AND COALESCE(claimed_at, 0) <= %s
+                      AND created_at >= NOW() - INTERVAL '14 days'
+                """, (token, user_id, int(time.time()) - 900))
                 return c.fetchone() is not None
     finally:
         release_conn(conn)
@@ -1199,14 +1173,16 @@ def finish_locked_message(token: str, user_id: int, delivered: bool):
 
 def get_payment(telegram_payment_charge_id: str):
     conn = get_conn()
-    c = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-    c.execute("""
-        SELECT * FROM payments
-        WHERE telegram_payment_charge_id = %s
-    """, (telegram_payment_charge_id,))
-    row = c.fetchone()
-    release_conn(conn)
-    return dict(row) if row else None
+    try:
+        c = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        c.execute("""
+            SELECT * FROM payments
+            WHERE telegram_payment_charge_id = %s
+        """, (telegram_payment_charge_id,))
+        row = c.fetchone()
+        return dict(row) if row else None
+    finally:
+        release_conn(conn)
 
 
 _PAYMENT_REPORT_SQL = """
@@ -1460,51 +1436,17 @@ def get_ad_report(campaign_id):
         release_conn(conn)
 
 
-def get_payments_by_user(user_id: int, limit: int = 10):
-    conn = get_conn()
-    c = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-    c.execute("""
-        SELECT *
-        FROM payments
-        WHERE user_id = %s
-        ORDER BY created_at DESC
-        LIMIT %s
-    """, (user_id, limit))
-    rows = c.fetchall()
-    release_conn(conn)
-    return [dict(r) for r in rows]
 
 
-def get_payments_count_by_user(user_id: int) -> int:
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute("""
-        SELECT COUNT(*)
-        FROM payments
-        WHERE user_id = %s
-    """, (user_id,))
-    count = c.fetchone()[0]
-    release_conn(conn)
-    return count
 
 
-def mark_payment_refunded(telegram_payment_charge_id: str):
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute("""
-        UPDATE payments
-        SET refunded = TRUE, refunded_at = NOW()
-        WHERE telegram_payment_charge_id = %s
-    """, (telegram_payment_charge_id,))
-    conn.commit()
-    release_conn(conn)
 
 
 def refund_stars_purchase(telegram_payment_charge_id: str, days: int):
     """Mark a Stars payment refunded and remove its granted days once."""
     conn = get_conn()
-    c = conn.cursor()
     try:
+        c = conn.cursor()
         c.execute("""
             UPDATE payments
             SET refunded = TRUE, refunded_at = NOW()
@@ -1517,6 +1459,7 @@ def refund_stars_purchase(telegram_payment_charge_id: str, days: int):
             return None
 
         user_id = row[0]
+        c.execute("SELECT user_id FROM users WHERE user_id = %s FOR UPDATE", (user_id,))
         c.execute(
             "SELECT COUNT(*) FROM connections WHERE owner_id = %s AND is_enabled = 1",
             (user_id,),
@@ -1560,8 +1503,8 @@ def create_platega_payment(
 ):
     """Store a pending Platega transaction before redirecting the user to pay."""
     conn = get_conn()
-    c = conn.cursor()
     try:
+        c = conn.cursor()
         c.execute("""
             INSERT INTO platega_payments (
                 transaction_id, user_id, plan_id, amount, currency,
@@ -1578,8 +1521,8 @@ def create_platega_payment(
 
 def mark_platega_payment_failed(transaction_id: str):
     conn = get_conn()
-    c = conn.cursor()
     try:
+        c = conn.cursor()
         c.execute("""
             UPDATE platega_payments SET status = 'FAILED'
             WHERE transaction_id = %s AND status = 'PENDING'
@@ -1597,8 +1540,8 @@ def apply_platega_payment(
 ) -> tuple[int, int] | None:
     """Confirm a known payment and grant its subscription exactly once."""
     conn = get_conn()
-    c = conn.cursor()
     try:
+        c = conn.cursor()
         c.execute("""
             UPDATE platega_payments
             SET status = 'CONFIRMED', payment_method = COALESCE(%s, payment_method), confirmed_at = NOW()
@@ -1616,6 +1559,7 @@ def apply_platega_payment(
             return None
 
         user_id, plan_id, days = row
+        c.execute("SELECT user_id FROM users WHERE user_id = %s FOR UPDATE", (user_id,))
         c.execute(
             "SELECT COUNT(*) FROM connections WHERE owner_id = %s AND is_enabled = 1",
             (user_id,),
@@ -1650,8 +1594,8 @@ def apply_platega_payment(
 
 def cancel_platega_payment(transaction_id: str, status: str):
     conn = get_conn()
-    c = conn.cursor()
     try:
+        c = conn.cursor()
         c.execute("""
             UPDATE platega_payments SET status = %s
             WHERE transaction_id = %s AND status = 'PENDING'
@@ -1664,8 +1608,8 @@ def cancel_platega_payment(transaction_id: str, status: str):
 def refund_platega_payment(transaction_id: str) -> tuple[int, int] | None:
     """Reverse access once after a Platega chargeback."""
     conn = get_conn()
-    c = conn.cursor()
     try:
+        c = conn.cursor()
         c.execute("""
             UPDATE platega_payments
             SET status = 'CHARGEBACKED', refunded = TRUE, refunded_at = NOW()
@@ -1677,6 +1621,7 @@ def refund_platega_payment(transaction_id: str) -> tuple[int, int] | None:
             conn.commit()
             return None
         user_id, days = row
+        c.execute("SELECT user_id FROM users WHERE user_id = %s FOR UPDATE", (user_id,))
         c.execute(
             "SELECT COUNT(*) FROM connections WHERE owner_id = %s AND is_enabled = 1",
             (user_id,),
@@ -1708,106 +1653,138 @@ def refund_platega_payment(transaction_id: str) -> tuple[int, int] | None:
 
 def save_support_message_link(admin_message_id: int, user_id: int):
     conn = get_conn()
-    c = conn.cursor()
-    c.execute("""
-        INSERT INTO support_message_links (admin_message_id, user_id)
-        VALUES (%s, %s)
-        ON CONFLICT (admin_message_id) DO UPDATE SET
-            user_id = EXCLUDED.user_id
-    """, (admin_message_id, user_id))
-    conn.commit()
-    release_conn(conn)
+    try:
+        c = conn.cursor()
+        c.execute("""
+            INSERT INTO support_message_links (admin_message_id, user_id)
+            VALUES (%s, %s)
+            ON CONFLICT (admin_message_id) DO UPDATE SET
+                user_id = EXCLUDED.user_id
+        """, (admin_message_id, user_id))
+        conn.commit()
+    finally:
+        release_conn(conn)
 
 
 def get_support_message_link(admin_message_id: int):
     conn = get_conn()
-    c = conn.cursor()
-    c.execute("""
-        SELECT user_id
-        FROM support_message_links
-        WHERE admin_message_id = %s
-    """, (admin_message_id,))
-    row = c.fetchone()
-    release_conn(conn)
-    return row[0] if row else None
+    try:
+        c = conn.cursor()
+        c.execute("""
+            SELECT user_id
+            FROM support_message_links
+            WHERE admin_message_id = %s
+        """, (admin_message_id,))
+        row = c.fetchone()
+        return row[0] if row else None
+    finally:
+        release_conn(conn)
 
 
 # в”Ђв”Ђ Р‘РёР·РЅРµСЃ-РїРѕРґРєР»СЋС‡РµРЅРёСЏ в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
 
 def save_connection(connection_id: str, owner_id: int, is_enabled: bool):
     conn = get_conn()
-    c = conn.cursor()
-    c.execute("""
-        INSERT INTO connections (connection_id, owner_id, is_enabled)
-        VALUES (%s, %s, %s)
-        ON CONFLICT(connection_id) DO UPDATE SET
-            owner_id = EXCLUDED.owner_id,
-            is_enabled = EXCLUDED.is_enabled
-    """, (connection_id, owner_id, int(is_enabled)))
-    if is_enabled:
+    try:
+        c = conn.cursor()
+        c.execute("SELECT sub_type, sub_expires, sub_remaining_seconds FROM users WHERE user_id = %s FOR UPDATE", (owner_id,))
+        user = c.fetchone()
         c.execute("""
-            UPDATE ad_acquisitions SET connected_at = COALESCE(connected_at, CURRENT_TIMESTAMP)
-            WHERE user_id = %s
-        """, (owner_id,))
-    conn.commit()
-    release_conn(conn)
+            INSERT INTO connections (connection_id, owner_id, is_enabled)
+            VALUES (%s, %s, %s)
+            ON CONFLICT(connection_id) DO UPDATE SET
+                owner_id = EXCLUDED.owner_id,
+                is_enabled = EXCLUDED.is_enabled
+        """, (connection_id, owner_id, int(is_enabled)))
+        if user and user[0] != "banned":
+            expires, remaining = user[1], int(user[2] or 0)
+            if isinstance(expires, str):
+                expires = datetime.fromisoformat(expires)
+            c.execute("SELECT COUNT(*) FROM connections WHERE owner_id = %s AND is_enabled = 1", (owner_id,))
+            active = c.fetchone()[0] > 0
+            now = now_msk()
+            if active and remaining > 0:
+                c.execute("UPDATE users SET sub_expires = %s, sub_remaining_seconds = 0 WHERE user_id = %s",
+                          (max(expires or now, now) + timedelta(seconds=remaining), owner_id))
+            elif not active and expires:
+                remaining += max(0, int((expires - now).total_seconds()))
+                c.execute("UPDATE users SET sub_expires = NULL, sub_remaining_seconds = %s WHERE user_id = %s",
+                          (remaining, owner_id))
+        if is_enabled:
+            c.execute("""
+                UPDATE ad_acquisitions SET connected_at = COALESCE(connected_at, CURRENT_TIMESTAMP)
+                WHERE user_id = %s
+            """, (owner_id,))
+        conn.commit()
+    finally:
+        release_conn(conn)
 
 
 def get_owner_by_connection(connection_id: str):
     conn = get_conn()
-    c = conn.cursor()
-    c.execute(
-        "SELECT owner_id FROM connections WHERE connection_id = %s AND is_enabled = 1",
-        (connection_id,),
-    )
-    row = c.fetchone()
-    release_conn(conn)
-    return row[0] if row else None
+    try:
+        c = conn.cursor()
+        c.execute(
+            "SELECT owner_id FROM connections WHERE connection_id = %s AND is_enabled = 1",
+            (connection_id,),
+        )
+        row = c.fetchone()
+        return row[0] if row else None
+    finally:
+        release_conn(conn)
 
 
 def get_connections_count() -> int:
     conn = get_conn()
-    c = conn.cursor()
-    c.execute("SELECT COUNT(*) FROM connections WHERE is_enabled = 1")
-    count = c.fetchone()[0]
-    release_conn(conn)
-    return count
+    try:
+        c = conn.cursor()
+        c.execute("SELECT COUNT(*) FROM connections WHERE is_enabled = 1")
+        count = c.fetchone()[0]
+        return count
+    finally:
+        release_conn(conn)
 
 
 def get_connections_count_for_user(user_id: int) -> int:
     if not user_id:
         return 0
     conn = get_conn()
-    c = conn.cursor()
-    c.execute("SELECT COUNT(*) FROM connections WHERE owner_id = %s AND is_enabled = 1", (user_id,))
-    count = c.fetchone()[0]
-    release_conn(conn)
-    return count
+    try:
+        c = conn.cursor()
+        c.execute("SELECT COUNT(*) FROM connections WHERE owner_id = %s AND is_enabled = 1", (user_id,))
+        count = c.fetchone()[0]
+        return count
+    finally:
+        release_conn(conn)
 
 
 def get_connected_owner_ids():
     conn = get_conn()
-    c = conn.cursor()
-    c.execute("SELECT DISTINCT owner_id FROM connections WHERE is_enabled = 1")
-    rows = c.fetchall()
-    release_conn(conn)
-    return [row[0] for row in rows]
+    try:
+        c = conn.cursor()
+        c.execute("SELECT DISTINCT owner_id FROM connections WHERE is_enabled = 1")
+        rows = c.fetchall()
+        return [row[0] for row in rows]
+    finally:
+        release_conn(conn)
 
 
 def get_recent_connections(limit: int = 10):
     conn = get_conn()
-    c = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-    c.execute("""
-        SELECT c.connection_id, c.owner_id, c.is_enabled, c.connected_at,
-               u.username, u.first_name, u.sub_type, u.sub_expires
-        FROM connections c
-        LEFT JOIN users u ON c.owner_id = u.user_id
-        ORDER BY c.connected_at DESC
-        LIMIT %s
-    """, (limit,))
-    rows = c.fetchall()
-    release_conn(conn)
-    return [dict(r) for r in rows]
+    try:
+        c = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        c.execute("""
+            SELECT c.connection_id, c.owner_id, c.is_enabled, c.connected_at,
+                   u.username, u.first_name, u.sub_type, u.sub_expires
+            FROM connections c
+            LEFT JOIN users u ON c.owner_id = u.user_id
+            ORDER BY c.connected_at DESC
+            LIMIT %s
+        """, (limit,))
+        rows = c.fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        release_conn(conn)
 
 
 # в”Ђв”Ђ Р РµС„РµСЂР°Р»СЊРЅР°СЏ СЃРёСЃС‚РµРјР° в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
@@ -1815,8 +1792,8 @@ def get_recent_connections(limit: int = 10):
 def add_referral(referrer_id: int, referred_id: int) -> bool:
     """Р”РѕР±Р°РІРёС‚СЊ СЂРµС„РµСЂР°Р»Р°. Р’РѕР·РІСЂР°С‰Р°РµС‚ True РµСЃР»Рё РЅРѕРІС‹Р№."""
     conn = get_conn()
-    c = conn.cursor()
     try:
+        c = conn.cursor()
         c.execute("""
             INSERT INTO referrals (referrer_id, referred_id, rewarded)
             VALUES (%s, %s, FALSE)
@@ -1835,8 +1812,8 @@ def add_referral(referrer_id: int, referred_id: int) -> bool:
 def reward_referral_for_connection(referred_id: int):
     """Grant referral days once, after the invited user connects the bot."""
     conn = get_conn()
-    c = conn.cursor()
     try:
+        c = conn.cursor()
         c.execute("""
             UPDATE referrals
             SET rewarded = TRUE
@@ -1849,6 +1826,7 @@ def reward_referral_for_connection(referred_id: int):
             return None
 
         referrer_id = row[0]
+        c.execute("SELECT user_id FROM users WHERE user_id = %s FOR UPDATE", (referrer_id,))
         c.execute(
             "SELECT COUNT(*) FROM connections WHERE owner_id = %s AND is_enabled = 1",
             (referrer_id,),
@@ -1881,55 +1859,54 @@ def reward_referral_for_connection(referred_id: int):
 
 def get_referral_count(user_id: int) -> int:
     conn = get_conn()
-    c = conn.cursor()
-    c.execute("SELECT COUNT(*) FROM referrals WHERE referrer_id = %s AND rewarded = TRUE", (user_id,))
-    count = c.fetchone()[0]
-    release_conn(conn)
-    return count
+    try:
+        c = conn.cursor()
+        c.execute("SELECT COUNT(*) FROM referrals WHERE referrer_id = %s AND rewarded = TRUE", (user_id,))
+        count = c.fetchone()[0]
+        return count
+    finally:
+        release_conn(conn)
 
 
 def get_referral_leaderboard(limit: int = 20):
     conn = get_conn()
-    c = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-    c.execute("""
-        SELECT r.referrer_id,
-               COUNT(*) AS referrals_count,
-               u.username,
-               u.first_name
-        FROM referrals r
-        LEFT JOIN users u ON u.user_id = r.referrer_id
-        WHERE r.rewarded = TRUE
-        GROUP BY r.referrer_id, u.username, u.first_name
-        ORDER BY referrals_count DESC, r.referrer_id DESC
-        LIMIT %s
-    """, (limit,))
-    rows = c.fetchall()
-    release_conn(conn)
-    return [dict(r) for r in rows]
+    try:
+        c = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        c.execute("""
+            SELECT r.referrer_id,
+                   COUNT(*) AS referrals_count,
+                   u.username,
+                   u.first_name
+            FROM referrals r
+            LEFT JOIN users u ON u.user_id = r.referrer_id
+            WHERE r.rewarded = TRUE
+            GROUP BY r.referrer_id, u.username, u.first_name
+            ORDER BY referrals_count DESC, r.referrer_id DESC
+            LIMIT %s
+        """, (limit,))
+        rows = c.fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        release_conn(conn)
 
 
 def get_referrals_by_referrer(user_id: int):
     conn = get_conn()
-    c = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-    c.execute("""
-        SELECT r.referred_id, r.created_at, u.username, u.first_name
-        FROM referrals r
-        LEFT JOIN users u ON u.user_id = r.referred_id
-        WHERE r.referrer_id = %s AND r.rewarded = TRUE
-        ORDER BY r.created_at DESC
-    """, (user_id,))
-    rows = c.fetchall()
-    release_conn(conn)
-    return [dict(r) for r in rows]
+    try:
+        c = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        c.execute("""
+            SELECT r.referred_id, r.created_at, u.username, u.first_name
+            FROM referrals r
+            LEFT JOIN users u ON u.user_id = r.referred_id
+            WHERE r.referrer_id = %s AND r.rewarded = TRUE
+            ORDER BY r.created_at DESC
+        """, (user_id,))
+        rows = c.fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        release_conn(conn)
 
 
-def get_referrer_for_user(user_id: int):
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute("SELECT referrer_id FROM referrals WHERE referred_id = %s", (user_id,))
-    row = c.fetchone()
-    release_conn(conn)
-    return row[0] if row else None
 
 
 # в”Ђв”Ђ РљСЌС€ С‚РµРєСЃС‚РѕРІС‹С… СЃРѕРѕР±С‰РµРЅРёР№ в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
@@ -1937,63 +1914,71 @@ def get_referrer_for_user(user_id: int):
 def cache_message(connection_id: str, chat_id: int, msg_id: int,
                   sender_name: str, text: str, date: str):
     conn = get_conn()
-    c = conn.cursor()
-    c.execute("""
-        INSERT INTO message_cache (connection_id, chat_id, msg_id, sender_name, text, date, created_at)
-        VALUES (%s, %s, %s, %s, %s, %s, NOW())
-        ON CONFLICT(connection_id, chat_id, msg_id) DO UPDATE SET
-            text = EXCLUDED.text,
-            sender_name = EXCLUDED.sender_name,
-            date = EXCLUDED.date
-    """, (
-        connection_id,
-        chat_id,
-        msg_id,
-        encrypt_value(sender_name),
-        encrypt_value(truncate_cached_text(text)),
-        date,
-    ))
-    conn.commit()
-    release_conn(conn)
+    try:
+        c = conn.cursor()
+        c.execute("""
+            INSERT INTO message_cache (connection_id, chat_id, msg_id, sender_name, text, date, created_at)
+            VALUES (%s, %s, %s, %s, %s, %s, NOW())
+            ON CONFLICT(connection_id, chat_id, msg_id) DO UPDATE SET
+                text = EXCLUDED.text,
+                sender_name = EXCLUDED.sender_name,
+                date = EXCLUDED.date
+        """, (
+            connection_id,
+            chat_id,
+            msg_id,
+            encrypt_value(sender_name),
+            encrypt_value(truncate_cached_text(text)),
+            date,
+        ))
+        conn.commit()
+    finally:
+        release_conn(conn)
 
 
 def get_cached_message(connection_id: str, chat_id: int, msg_id: int):
     conn = get_conn()
-    c = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-    c.execute("""
-        SELECT * FROM message_cache
-        WHERE connection_id = %s AND chat_id = %s AND msg_id = %s
-    """, (connection_id, chat_id, msg_id))
-    row = c.fetchone()
-    release_conn(conn)
-    if not row:
-        return None
-    result = dict(row)
-    result["sender_name"] = decrypt_value(result.get("sender_name"))
-    result["text"] = decrypt_value(result.get("text"))
-    return result
+    try:
+        c = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        c.execute("""
+            SELECT * FROM message_cache
+            WHERE connection_id = %s AND chat_id = %s AND msg_id = %s
+        """, (connection_id, chat_id, msg_id))
+        row = c.fetchone()
+        if not row:
+            return None
+        result = dict(row)
+        result["sender_name"] = decrypt_value(result.get("sender_name"))
+        result["text"] = decrypt_value(result.get("text"))
+        return result
+    finally:
+        release_conn(conn)
 
 
 def update_cached_text(connection_id: str, chat_id: int, msg_id: int, new_text: str):
     conn = get_conn()
-    c = conn.cursor()
-    c.execute("""
-        UPDATE message_cache SET text = %s
-        WHERE connection_id = %s AND chat_id = %s AND msg_id = %s
-    """, (encrypt_value(truncate_cached_text(new_text)), connection_id, chat_id, msg_id))
-    conn.commit()
-    release_conn(conn)
+    try:
+        c = conn.cursor()
+        c.execute("""
+            UPDATE message_cache SET text = %s
+            WHERE connection_id = %s AND chat_id = %s AND msg_id = %s
+        """, (encrypt_value(truncate_cached_text(new_text)), connection_id, chat_id, msg_id))
+        conn.commit()
+    finally:
+        release_conn(conn)
 
 
 def delete_cached_message(connection_id: str, chat_id: int, msg_id: int):
     conn = get_conn()
-    c = conn.cursor()
-    c.execute("""
-        DELETE FROM message_cache
-        WHERE connection_id = %s AND chat_id = %s AND msg_id = %s
-    """, (connection_id, chat_id, msg_id))
-    conn.commit()
-    release_conn(conn)
+    try:
+        c = conn.cursor()
+        c.execute("""
+            DELETE FROM message_cache
+            WHERE connection_id = %s AND chat_id = %s AND msg_id = %s
+        """, (connection_id, chat_id, msg_id))
+        conn.commit()
+    finally:
+        release_conn(conn)
 
 
 # в”Ђв”Ђ РљСЌС€ РјРµРґРёР° в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
@@ -2001,47 +1986,53 @@ def delete_cached_message(connection_id: str, chat_id: int, msg_id: int):
 def cache_media(connection_id: str, chat_id: int, msg_id: int,
                 sender_name: str, file_type: str, file_id: str, date: str):
     conn = get_conn()
-    c = conn.cursor()
-    c.execute("""
-        INSERT INTO media_cache (connection_id, chat_id, msg_id, sender_name, file_type, file_id, date, created_at)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, NOW())
-        ON CONFLICT(connection_id, chat_id, msg_id) DO NOTHING
-    """, (
-        connection_id,
-        chat_id,
-        msg_id,
-        encrypt_value(sender_name),
-        file_type,
-        encrypt_value(file_id),
-        date,
-    ))
-    conn.commit()
-    release_conn(conn)
+    try:
+        c = conn.cursor()
+        c.execute("""
+            INSERT INTO media_cache (connection_id, chat_id, msg_id, sender_name, file_type, file_id, date, created_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, NOW())
+            ON CONFLICT(connection_id, chat_id, msg_id) DO NOTHING
+        """, (
+            connection_id,
+            chat_id,
+            msg_id,
+            encrypt_value(sender_name),
+            file_type,
+            encrypt_value(file_id),
+            date,
+        ))
+        conn.commit()
+    finally:
+        release_conn(conn)
 
 
 def get_cached_media(connection_id: str, chat_id: int, msg_id: int):
     conn = get_conn()
-    c = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-    c.execute("""
-        SELECT * FROM media_cache
-        WHERE connection_id = %s AND chat_id = %s AND msg_id = %s
-    """, (connection_id, chat_id, msg_id))
-    row = c.fetchone()
-    release_conn(conn)
-    if not row:
-        return None
-    result = dict(row)
-    result["sender_name"] = decrypt_value(result.get("sender_name"))
-    result["file_id"] = decrypt_value(result.get("file_id"))
-    return result
+    try:
+        c = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        c.execute("""
+            SELECT * FROM media_cache
+            WHERE connection_id = %s AND chat_id = %s AND msg_id = %s
+        """, (connection_id, chat_id, msg_id))
+        row = c.fetchone()
+        if not row:
+            return None
+        result = dict(row)
+        result["sender_name"] = decrypt_value(result.get("sender_name"))
+        result["file_id"] = decrypt_value(result.get("file_id"))
+        return result
+    finally:
+        release_conn(conn)
 
 
 def delete_cached_media(connection_id: str, chat_id: int, msg_id: int):
     conn = get_conn()
-    c = conn.cursor()
-    c.execute("""
-        DELETE FROM media_cache
-        WHERE connection_id = %s AND chat_id = %s AND msg_id = %s
-    """, (connection_id, chat_id, msg_id))
-    conn.commit()
-    release_conn(conn)
+    try:
+        c = conn.cursor()
+        c.execute("""
+            DELETE FROM media_cache
+            WHERE connection_id = %s AND chat_id = %s AND msg_id = %s
+        """, (connection_id, chat_id, msg_id))
+        conn.commit()
+    finally:
+        release_conn(conn)

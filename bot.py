@@ -268,13 +268,13 @@ def get_pending_locked_message(token, user_id):
     return pending
 
 
-def deliver_locked_message(token, user_id, message_id):
+def deliver_locked_message(token, user_id, message_id, retry_media=False):
     pending = get_pending_locked_message(token, user_id)
     if not pending or not db.is_sub_active(user_id):
         return False
-    if not db.claim_locked_message(token, user_id):
-        return False
     is_text = bool(pending.get("saved_text"))
+    if not db.claim_locked_message(token, user_id, allow_stale=is_text or retry_media):
+        return False
     result = {"ok": False}
     try:
         if is_text:
@@ -551,6 +551,8 @@ def connection_reminder_text():
 _REMINDER_BROADCAST_LOCK = threading.Lock()
 _REMINDER_BROADCAST_PENDING = {}
 _REMINDER_BROADCAST_RUNNING = False
+_BROADCAST_LOCK = threading.Lock()
+_BROADCAST_RUNNING = False
 
 
 def send_connection_reminder(user_id):
@@ -698,12 +700,15 @@ def start_connection_reminder_worker():
     threading.Thread(target=worker, name="connection-reminders", daemon=True).start()
 
 
-def telegram_post(method, data, content_type, timeout):
+def telegram_post(method, data, content_type, timeout, content_length=None):
     try:
+        headers = {"Content-Type": content_type}
+        if content_length is not None:
+            headers["Content-Length"] = str(content_length)
         # Never replay a POST: a lost response can still mean delivery succeeded.
         result = _TELEGRAM_HTTP.request(
             "POST", f"{BASE}/{method}", body=data,
-            headers={"Content-Type": content_type},
+            headers=headers,
             timeout=urllib3.Timeout(connect=10, read=timeout),
             retries=False, redirect=False,
         )
@@ -935,20 +940,24 @@ def send_local_file(chat_id, file_path, file_type, caption=""):
 
     mime_type = mimetypes.guess_type(file_path)[0] or "application/octet-stream"
     filename = os.path.basename(file_path)
-    with open(file_path, "rb") as media_file:
-        media_data = media_file.read()
-
     body.extend(f"--{boundary}\r\n".encode())
     body.extend(f'Content-Disposition: form-data; name="{field_name}"; filename="{filename}"\r\n'.encode())
     body.extend(f"Content-Type: {mime_type}\r\n\r\n".encode())
-    body.extend(media_data)
-    body.extend(f"\r\n--{boundary}--\r\n".encode())
+    trailer = f"\r\n--{boundary}--\r\n".encode()
 
     started_at = time.monotonic()
-    response = telegram_post(
-        method, bytes(body), f"multipart/form-data; boundary={boundary}",
-        TELEGRAM_FILE_UPLOAD_TIMEOUT,
-    )
+    with open(file_path, "rb") as media_file:
+        def chunks():
+            yield bytes(body)
+            while chunk := media_file.read(64 * 1024):
+                yield chunk
+            yield trailer
+
+        response = telegram_post(
+            method, chunks(), f"multipart/form-data; boundary={boundary}",
+            TELEGRAM_FILE_UPLOAD_TIMEOUT,
+            content_length=len(body) + os.fstat(media_file.fileno()).st_size + len(trailer),
+        )
     record_delivery_block(chat_id, response)
     logging.info("Telegram media upload file_type=%s elapsed=%.2fs ok=%s", file_type, time.monotonic() - started_at, response.get("ok"))
     if response.get("ok") and caption and file_type in MEDIA_WITHOUT_CAPTION:
@@ -1612,11 +1621,40 @@ def render_user_line(user: dict) -> str:
         link = f'<a href="tg://user?id={uid}">{name}</a>'
     sub = escape_html(user.get("sub_type", "?"), 30)
     exp = format_db_date(user.get("sub_expires"))
-    sub_icon = "✅" if db.is_sub_active(uid) else "❌"
-    conn_count = db.get_connections_count_for_user(uid)
-    ref_count = db.get_referral_count(uid)
+    if "connection_count" in user and "referral_count" in user:
+        conn_count, ref_count = user["connection_count"], user["referral_count"]
+        active = bool(conn_count and user.get("sub_expires") and is_user_sub_active_row(user))
+    else:
+        active = db.is_sub_active(uid)
+        conn_count = db.get_connections_count_for_user(uid)
+        ref_count = db.get_referral_count(uid)
+    sub_icon = "✅" if active else "❌"
     automation_status = "🔗 автоподкл" if conn_count else "➖ не подключен"
     return f"{sub_icon} {link} · <code>{uid}</code> · {sub} до {exp} · {automation_status} · реф: {ref_count}"
+
+
+_USER_SEARCHES = OrderedDict()
+
+
+def encode_user_query(query):
+    encoded = urllib.parse.quote(query) if query else ""
+    if len(encoded) <= 36:
+        return encoded
+    token = "~" + uuid.uuid4().hex[:16]
+    _USER_SEARCHES[token] = (time.monotonic() + 3600, query)
+    while len(_USER_SEARCHES) > 1000:
+        _USER_SEARCHES.popitem(last=False)
+    return token
+
+
+def decode_user_query(encoded):
+    if not encoded.startswith("~"):
+        return urllib.parse.unquote(encoded)
+    entry = _USER_SEARCHES.get(encoded)
+    if entry and entry[0] > time.monotonic():
+        return entry[1]
+    _USER_SEARCHES.pop(encoded, None)
+    return None
 
 
 def users_page_text_and_keyboard(
@@ -1647,7 +1685,7 @@ def users_page_text_and_keyboard(
     else:
         text = header + "\n".join(render_user_line(user) for user in chunk)
 
-    encoded_query = urllib.parse.quote(query) if query else ""
+    encoded_query = encode_user_query(query)
     keyboard_rows = []
     mode_callback = "users:all:1:" if connected_only else "users:conn:1:"
     mode_text = "👥 Показать всех" if connected_only else "🔗 Кто подключил бота"
@@ -1689,7 +1727,7 @@ def referrals_text(page: int = 1, query: str = "") -> tuple[str, dict | None]:
             f"{index}. {escape_html(name, 100)} (<code>{user_id}</code>) — <b>{item.get('referrals_count', 0)}</b>\n"
             f"   Кого привёл: {preview_text}"
         )
-    encoded_query = urllib.parse.quote(query) if query else ""
+    encoded_query = encode_user_query(query)
     keyboard = {"inline_keyboard": [[{"text": "🔙 Назад", "callback_data": f"users:all:{page}:{encoded_query}"}]]}
     return "\n".join(lines), keyboard
 
@@ -1706,8 +1744,40 @@ def copy_message(chat_id: int, from_chat_id: int, message_id: int):
     return result
 
 
-def run_broadcast(scope: str, source_chat_id: int, text: str | None = None, source_message_id: int | None = None):
-    targets = get_broadcast_targets(scope)
+def start_broadcast(scope, source_chat_id, admin_chat_id, text=None, source_message_id=None):
+    global _BROADCAST_RUNNING
+    with _BROADCAST_LOCK:
+        if _BROADCAST_RUNNING:
+            send(admin_chat_id, "Рассылка уже выполняется. Дождись итогов.")
+            return
+        _BROADCAST_RUNNING = True
+
+    def worker():
+        global _BROADCAST_RUNNING
+        try:
+            targets = get_broadcast_targets(scope)
+            send(admin_chat_id, f"Рассылка запущена. Получателей: {len(targets)}")
+            result = run_broadcast(scope, source_chat_id, text, source_message_id, targets=targets)
+            send(admin_chat_id, f"Рассылка завершена.\nПолучателей: {result['total']}\n"
+                 f"Отправлено: {result['sent']}\nОшибок: {result['failed']}")
+        except Exception:
+            logging.exception("Broadcast worker failed")
+            send(admin_chat_id, "Рассылка прервана из-за ошибки. Не запускай повторно без проверки: часть сообщений могла быть отправлена.")
+        finally:
+            with _BROADCAST_LOCK:
+                _BROADCAST_RUNNING = False
+
+    try:
+        threading.Thread(target=worker, name="broadcast", daemon=True).start()
+    except Exception:
+        with _BROADCAST_LOCK:
+            _BROADCAST_RUNNING = False
+        raise
+
+
+def run_broadcast(scope: str, source_chat_id: int, text: str | None = None, source_message_id: int | None = None, targets=None):
+    if targets is None:
+        targets = get_broadcast_targets(scope)
     if not targets:
         return {"sent": 0, "failed": 0, "total": 0}
 
@@ -2709,25 +2779,15 @@ def handle_update(update: dict):
             else:
                 source_chat_id = None
 
-            targets = get_broadcast_targets(scope)
-            if not targets:
-                send(chat_id, "ℹ️ Нет получателей для рассылки.")
+            if chat_id != ADMIN_ID:
+                send(chat_id, "Запускай рассылку в личном чате с ботом.")
                 return
-
-            scope_label = {"all": "всем пользователям", "sub": "активным подписчикам", "conn": "подключённым"}[scope]
-            send(chat_id, f"🔄 Рассылка запущена {scope_label}. Получателей: {len(targets)}")
-            result = run_broadcast(
+            start_broadcast(
                 scope=scope,
                 source_chat_id=source_chat_id or msg["chat"]["id"],
+                admin_chat_id=chat_id,
                 text=broadcast_text or None,
                 source_message_id=source_message_id,
-            )
-            send(
-                chat_id,
-                f"✅ Рассылка завершена.\n"
-                f"Получателей: {result['total']}\n"
-                f"Отправлено: {result['sent']}\n"
-                f"Ошибок: {result['failed']}"
             )
             return
 
@@ -2874,7 +2934,10 @@ def handle_update(update: dict):
         elif data.startswith("users:ref:") and user_id == ADMIN_ID:
             _, _, page_str, encoded_query = data.split(":", 3)
             page = int(page_str)
-            query = urllib.parse.unquote(encoded_query) if encoded_query else ""
+            query = decode_user_query(encoded_query)
+            if query is None:
+                send(ADMIN_ID, "Поиск устарел. Повтори /users с нужным именем.")
+                return
             text_out, keyboard = referrals_text(page=page, query=query)
             api(
                 "editMessageText",
@@ -2887,7 +2950,10 @@ def handle_update(update: dict):
         elif data.startswith(("users:all:", "users:conn:")) and user_id == ADMIN_ID:
             _, mode, page_str, encoded_query = data.split(":", 3)
             page = int(page_str)
-            query = urllib.parse.unquote(encoded_query) if encoded_query else ""
+            query = decode_user_query(encoded_query)
+            if query is None:
+                send(ADMIN_ID, "Поиск устарел. Повтори /users с нужным именем.")
+                return
             users = filter_users(query)
             text_out, keyboard = users_page_text_and_keyboard(
                 users,
@@ -2903,7 +2969,7 @@ def handle_update(update: dict):
                 parse_mode="HTML",
                 reply_markup=keyboard,
             )
-        elif data.startswith("show_locked:"):
+        elif data.startswith(("show_locked:", "retry_locked:")):
             token = data.split(":", 1)[1]
             if cq["message"]["chat"]["id"] != user_id:
                 return
@@ -2922,8 +2988,15 @@ def handle_update(update: dict):
                 )
                 return
 
-            if not deliver_locked_message(token, user_id, cq["message"]["message_id"]):
-                send(user_id, "Не удалось подтвердить показ сообщения. Для медиа Telegram мог уже закрыть доступ к файлу.")
+            retry_media = data.startswith("retry_locked:")
+            if not deliver_locked_message(token, user_id, cq["message"]["message_id"], retry_media=retry_media):
+                if db.locked_message_retry_available(token, user_id):
+                    send(user_id, "Предыдущая отправка не подтверждена. Файл мог уже прийти. "
+                         "Проверь сообщения выше; повторная отправка может создать копию.",
+                         keyboard={"inline_keyboard": [[{"text": "Повторить отправку", "callback_data": f"retry_locked:{token}"}]]})
+                else:
+                    send(user_id, "Не удалось подтвердить показ сообщения. Медиа могло уже прийти или стать недоступным. "
+                         "Если отправка зависла, нажми «Показать сообщение» ещё раз через 15 минут.")
         elif data == "buy_platega_monthly":
             payment_url, error_message = create_platega_payment(user_id)
             if not payment_url:
@@ -2977,7 +3050,6 @@ def handle_update(update: dict):
         db.save_user(owner_id, owner.get("username", ""), owner.get("first_name", ""))
         db.save_connection(bc["id"], owner_id, is_enabled)
         if is_enabled:
-            db.resume_subscription(owner_id)
             referrer_id = db.reward_referral_for_connection(owner_id)
             if referrer_id:
                 send(
@@ -2987,8 +3059,6 @@ def handle_update(update: dict):
                 )
             send(owner_id, "✅ <b>Бот подключён!</b>\n\nБуду присылать уведомления об удалённых и изменённых сообщениях.", keyboard=main_keyboard())
         else:
-            if db.get_connections_count_for_user(owner_id) == 0:
-                db.pause_subscription(owner_id)
             send(owner_id, "❌ Бот отключён.\n\nПричина: нет подключённых чатов.", keyboard=main_keyboard())
 
     # ── Новое сообщение из бизнес-чата ────────────────────
@@ -3235,11 +3305,13 @@ def main():
                 continue
 
             for update in result.get("result", []):
-                offset = update["update_id"] + 1
                 try:
                     handle_update(update)
                 except Exception as e:
-                    logging.error(f"Ошибка: {e}")
+                    logging.exception("Update %s failed; leaving it unconfirmed", update.get("update_id"))
+                    time.sleep(5)
+                    break
+                offset = update["update_id"] + 1
 
         except KeyboardInterrupt:
             break
