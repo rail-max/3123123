@@ -117,6 +117,7 @@ BOT_USERNAME = ""
 MSK = ZoneInfo("Europe/Moscow")
 REQUIRED_CHANNEL_USERNAME = "@DialogDelNews"
 REQUIRED_CHANNEL_URL = "https://t.me/DialogDelNews"
+REQUIRE_CHANNEL_SUBSCRIPTION = os.getenv("REQUIRE_CHANNEL_SUBSCRIPTION", "0") == "1"
 BUSINESS_RATE_LIMIT_PER_MINUTE = int(os.getenv("BUSINESS_RATE_LIMIT_PER_MINUTE", "120"))
 _BUSINESS_RATE_BUCKETS = {}
 _BUSINESS_REPLY_MEDIA_SENT = {}
@@ -481,6 +482,7 @@ class HealthHandler(BaseHTTPRequestHandler):
                 payment = db.apply_platega_payment(transaction_id, amount, currency, payment_method)
                 if payment:
                     user_id, days = payment
+                    track_funnel_event(user_id, "payment_success")
                     send(user_id, f"✅ <b>Оплата через Platega прошла!</b>\nПодписка на <b>{days} дней</b> активирована.", keyboard=main_keyboard())
                     deliver_requested_locked_messages(user_id)
                 else:
@@ -762,6 +764,8 @@ def setup_command_menu():
 
 
 def is_required_channel_member(user_id: int) -> bool:
+    if not REQUIRE_CHANNEL_SUBSCRIPTION:
+        return True
     result = api("getChatMember", chat_id=REQUIRED_CHANNEL_USERNAME, user_id=user_id)
     if not result.get("ok"):
         logging.warning("Required channel membership check failed for user_id=%s: %s", user_id, result)
@@ -812,7 +816,9 @@ def ensure_channel_trial(user_id: int, chat_id: int | None = None, notify: bool 
         logging.error("Failed to grant channel trial user_id=%s: %s", user_id, exc)
         return False
     if granted and notify and chat_id:
-        send(chat_id, "✅ <b>Подписка на канал найдена!</b>\nВам выдано <b>7 дней доступа</b>.")
+        send(chat_id, "✅ <b>Вам выдано 7 дней доступа!</b>\nПодключите бота к чатам, чтобы начать пользоваться.")
+    if granted:
+        track_funnel_event(user_id, "trial_granted")
     return granted
 
 
@@ -1857,6 +1863,7 @@ def useful_result_key(connection_id, chat_id, message_id):
 
 
 def record_delivered_result(user_id, source_key):
+    track_funnel_event(user_id, "first_saved")
     if not source_key:
         return
     try:
@@ -1877,6 +1884,50 @@ def record_delivered_result(user_id, source_key):
         logging.exception("Referral milestone failed for user_id=%s", user_id)
 
 
+FUNNEL_LABELS = (
+    ("start", "Запустили бота"),
+    ("trial_granted", "Получили 7 дней доступа"),
+    ("instruction", "Получили инструкцию"),
+    ("connected", "Подключили бота"),
+    ("first_saved", "Получили сохранённое сообщение"),
+    ("trial_expired", "Получили уведомление об окончании пробника"),
+    ("expired_notice", "Получили уведомление об окончании доступа"),
+    ("subscription_view", "Открыли тарифы"),
+    ("checkout_started", "Выбрали тариф для оплаты"),
+    ("invoice_created", "Получили счёт или ссылку на оплату"),
+    ("payment_success", "Оплатили, доступ начислен"),
+)
+
+
+def track_funnel_event(user_id, event):
+    if not isinstance(user_id, int) or user_id <= 0 or user_id == ADMIN_ID:
+        return
+    try:
+        db.record_funnel_event(user_id, event, int(time.time()))
+    except Exception:
+        # Analytics must not interrupt a payment or delivery.
+        logging.exception("Funnel event failed: %s user_id=%s", event, user_id)
+
+
+def funnel_report_view(days=30):
+    since = max(0, int(time.time()) - days * 86400) if days else 0
+    counts = db.get_funnel_report(since, ADMIN_ID)
+    title = f"за последние {days} дней" if days else "за всё время учёта"
+    lines = [f"📊 <b>Воронка · {title}</b>",
+             "Группа: пользователи, чей первый учтённый /start попал в этот период. "
+             "Ниже — их первые события после этого запуска, по текущий момент."]
+    lines.extend(f"{label}: <b>{counts.get(event, 0)}</b>" for event, label in FUNNEL_LABELS)
+    started = counts.get("start", 0)
+    if started:
+        lines.append(f"\nЗапуск → подключение: {counts.get('connected', 0) / started:.1%}\n"
+                     f"Запуск → оплата: {counts.get('payment_success', 0) / started:.1%}")
+    lines.append("\nУникальные пользователи, без повторов и администратора. "
+                 "События могут идти в разном порядке. Учёт начат с установки обновления, старые события не восстановлены. "
+                 "Оплатившие включают последующие возвраты.\n"
+                 "<code>/funnel 7</code> · <code>/funnel 30</code> · <code>/funnel all</code>")
+    return "\n".join(lines)
+
+
 def referral_reminder_view(user_id, kind, expires=None):
     invite = {"text": "🎁 Пригласить друга +3 дня", "url": referral_share_url(user_id)}
     if kind == "expiring":
@@ -1887,17 +1938,22 @@ def referral_reminder_view(user_id, kind, expires=None):
             "🎁 Другу нужно перейти по твоей ссылке и подключить бота к своим чатам. "
             "После подключения тебе начислятся <b>+3 дня</b>."
         )
-        buttons = [[invite], [{"text": "💳 Продлить подписку", "callback_data": "referral:renew"}]]
     else:
+        title = "⏰ Твой бесплатный доступ закончился" if kind == "trial_expired" else "⏰ Твой доступ закончился"
         text = (
-            "🔔 <b>Верни доступ к DialogDelBot</b>\n\n"
-            "Бот всё ещё подключён к твоим чатам, но подписка закончилась.\n\n"
-            "🎁 <b>Пригласи друга и получи 3 дня доступа бесплатно!</b>\n\n"
+            f"<b>{title}</b>\n\n"
+            "Бот всё ещё подключён к твоим чатам и продолжает отслеживать доступные сообщения по твоим настройкам.\n\n"
+            "Чтобы снова видеть содержимое удалённых и изменённых сообщений, продли доступ.\n\n"
+            f"💳 <b>Продлить на {PLATEGA_MONTHLY_DAYS} дней — {PLATEGA_MONTHLY_AMOUNT} ₽</b>\n\n"
+            "🎁 Или пригласи друга и получи <b>+3 дня</b>.\n"
             "Другу нужно перейти по твоей ссылке и подключить бота к своим чатам. "
-            "После подключения тебе начислятся <b>+3 дня</b>.\n\n"
-            "🤝 Помоги другу не терять важные сообщения — и продолжай пользоваться ботом сам!"
+            "После подключения тебе начислятся <b>+3 дня</b>."
         )
-        buttons = [[invite]]
+    buttons = [
+        [{"text": f"💳 Продлить на {PLATEGA_MONTHLY_DAYS} дней — {PLATEGA_MONTHLY_AMOUNT} ₽", "callback_data": "buy_platega_monthly", "style": "success"}],
+        [{"text": "⭐ Telegram Stars / другие тарифы", "callback_data": "referral:renew"}],
+        [invite],
+    ]
     return text, {"inline_keyboard": buttons}
 
 
@@ -1910,19 +1966,24 @@ def run_referral_reminders_once():
             if not db.referral_reminder_allowed(user_id, reminder["kind"], reminder["sub_expires"], int(time.time())):
                 continue
             text, keyboard = referral_reminder_view(user_id, reminder["kind"], reminder["sub_expires"])
-            send(user_id, text, keyboard=keyboard)
+            result = send(user_id, text, keyboard=keyboard)
+            if result.get("ok") and reminder["kind"] != "expiring":
+                track_funnel_event(user_id, "trial_expired" if reminder["kind"] == "trial_expired" else "expired_notice")
             time.sleep(0.1)
         except Exception:
             logging.exception("Referral reminder failed for user_id=%s", user_id)
 
 
 def send_subscription_options(chat_id):
-    return send(chat_id,
+    result = send(chat_id,
         f"💳 <b>Купить подписку</b>\n\n⭐ <b>Telegram Stars:</b>\n"
         f"{stars_plan_lines('Telegram Stars')}\n\n💳 СБП / QR через Platega: 30 дней — 120 ₽",
         keyboard={"inline_keyboard": stars_plan_keyboard_rows() + [
             [{"text": "💳 30 дней — 120 ₽ (СБП / QR)", "callback_data": "buy_platega_monthly", "style": "success"}],
         ]})
+    if result.get("ok"):
+        track_funnel_event(chat_id, "subscription_view")
+    return result
 
 
 def legal_keyboard() -> dict | None:
@@ -2115,8 +2176,10 @@ def send_instruction(chat_id: int):
     image_path = next((path for path in INSTRUCTION_IMAGE_PATHS if os.path.exists(path)), None)
     if image_path:
         send_photo(chat_id, image_path)
-        return send(chat_id, instruction_caption(), keyboard=keyboard)
-    return send(chat_id, instruction_caption(), keyboard=keyboard)
+    result = send(chat_id, instruction_caption(), keyboard=keyboard)
+    if result.get("ok"):
+        track_funnel_event(chat_id, "instruction")
+    return result
 
 
 def get_user_link(user: dict) -> str:
@@ -2204,6 +2267,7 @@ def handle_update(update: dict):
         if not granted:
             logging.info("Duplicate successful payment ignored: %s", telegram_charge_id)
             return
+        track_funnel_event(user_id, "payment_success")
         send(
             user_id,
             f"✅ <b>Оплата прошла!</b>\nПодписка на <b>{plan['days']} дней</b> активирована.",
@@ -2232,14 +2296,15 @@ def handle_update(update: dict):
             return
 
         if command == "/start" and chat_id == user_id and user_id != ADMIN_ID:
+            track_funnel_event(user_id, "start")
             payload = text.split(maxsplit=1)
             if len(payload) == 2 and re.fullmatch(r"ad_[a-zA-Z0-9_-]{1,61}", payload[1]):
                 db.record_ad_start(payload[1][3:], user_id, user.get("username", ""), user.get("first_name", ""))
         db.save_user(user_id, user.get("username", ""), user.get("first_name", ""))
         s = get_settings(user_id)
 
-        if user_id != ADMIN_ID and not text.startswith("/start"):
-            if not is_required_channel_member(user_id):
+        if user_id != ADMIN_ID and chat_id == user_id and command != "/start":
+            if REQUIRE_CHANNEL_SUBSCRIPTION and not is_required_channel_member(user_id):
                 send_subscription_gate(chat_id)
                 return
             ensure_channel_trial(user_id, chat_id, notify=True)
@@ -2363,6 +2428,18 @@ def handle_update(update: dict):
                 prepare_reminder_broadcast(chat_id)
             else:
                 send(chat_id, "Рассылка: /remind\nОтправить пример только себе: /remind test")
+            return
+
+        if command == "/funnel":
+            if user_id != ADMIN_ID or chat_id != ADMIN_ID:
+                send(chat_id, "Команда доступна только администратору в личном чате с ботом.")
+                return
+            parts = text.split()
+            if len(parts) > 2 or (len(parts) == 2 and parts[1] not in ("7", "30", "all")):
+                send(chat_id, "Формат: /funnel, /funnel 7, /funnel 30 или /funnel all")
+                return
+            days = 30 if len(parts) == 1 else 0 if parts[1] == "all" else int(parts[1])
+            send(chat_id, funnel_report_view(days))
             return
 
         if command == "/ads":
@@ -2513,7 +2590,7 @@ def handle_update(update: dict):
                     db.add_referral(referrer_id, user_id)
 
         if text.startswith("/start"):
-            if is_required_channel_member(user_id):
+            if not REQUIRE_CHANNEL_SUBSCRIPTION or is_required_channel_member(user_id):
                 unlock_start_after_channel(user_id, chat_id)
             else:
                 send_subscription_gate(chat_id)
@@ -2685,6 +2762,7 @@ def handle_update(update: dict):
                 f"/payments — статистика и история всех оплат\n"
                 f"/payments user_id|@user — история оплат пользователя\n"
                 f"/ads — рекламные ссылки и статистика\n"
+                f"/funnel — воронка от запуска до оплаты\n"
                 f"/bd [текст] — рассылка всем пользователям (alias /broadcast)\n"
                 f"/bdsub [текст] — рассылка только активным подписчикам\n"
                 f"/bdconn [текст] — рассылка только подключённым\n"
@@ -2873,7 +2951,10 @@ def handle_update(update: dict):
             api("answerCallbackQuery", callback_query_id=cq["id"], text="Открой статистику в личном чате с ботом.", show_alert=True)
             return
         if data == "check_required_channel":
-            if not is_required_channel_member(user_id):
+            if cq.get("message", {}).get("chat", {}).get("id") != user_id:
+                api("answerCallbackQuery", callback_query_id=cq["id"], text="Открой личный чат с ботом.", show_alert=True)
+                return
+            if REQUIRE_CHANNEL_SUBSCRIPTION and not is_required_channel_member(user_id):
                 api(
                     "answerCallbackQuery",
                     callback_query_id=cq["id"],
@@ -2886,13 +2967,13 @@ def handle_update(update: dict):
                 "editMessageText",
                 chat_id=cq["message"]["chat"]["id"],
                 message_id=cq["message"]["message_id"],
-                text="✅ Подписка найдена. Открываю бота.",
+                text="✅ Подписка найдена. Открываю бота." if REQUIRE_CHANNEL_SUBSCRIPTION else "✅ Подписка на канал больше не обязательна. Открываю бота.",
                 parse_mode="HTML",
             )
             unlock_start_after_channel(user_id, cq["message"]["chat"]["id"])
             return
 
-        if user_id != ADMIN_ID and not is_required_channel_member(user_id):
+        if user_id != ADMIN_ID and REQUIRE_CHANNEL_SUBSCRIPTION and not is_required_channel_member(user_id):
             api(
                 "answerCallbackQuery",
                 callback_query_id=cq["id"],
@@ -2901,7 +2982,7 @@ def handle_update(update: dict):
             )
             send_subscription_gate(cq["message"]["chat"]["id"])
             return
-        if user_id != ADMIN_ID:
+        if user_id != ADMIN_ID and cq.get("message", {}).get("chat", {}).get("id") == user_id:
             ensure_channel_trial(user_id, cq["message"]["chat"]["id"], notify=True)
 
         api("answerCallbackQuery", callback_query_id=cq["id"])
@@ -3040,21 +3121,31 @@ def handle_update(update: dict):
                     send(user_id, "Не удалось подтвердить показ сообщения. Медиа могло уже прийти или стать недоступным. "
                          "Если отправка зависла, нажми «Показать сообщение» ещё раз через 15 минут.")
         elif data == "buy_platega_monthly":
+            if cq.get("message", {}).get("chat", {}).get("id") != user_id:
+                return
+            track_funnel_event(user_id, "checkout_started")
             payment_url, error_message = create_platega_payment(user_id)
             if not payment_url:
                 send(user_id, f"❌ {error_message}", keyboard=main_keyboard())
                 return
-            send(
+            result = send(
                 user_id,
                 "💳 <b>Оплата 30 дней — 120 ₽</b>\n\n"
                 "Открой страницу оплаты, отсканируй QR-код или оплати через СБП. "
                 "После подтверждения подписка активируется автоматически.",
                 keyboard={"inline_keyboard": [[{"text": "Оплатить 120 ₽", "url": payment_url, "style": "success"}]]},
             )
+            if result.get("ok"):
+                track_funnel_event(user_id, "invoice_created")
         elif data.startswith("buy_") and data.replace("buy_", "", 1) in PAYMENT_PLANS:
+            if cq.get("message", {}).get("chat", {}).get("id") != user_id:
+                return
+            track_funnel_event(user_id, "checkout_started")
             payload = data.replace("buy_", "", 1)
             plan = PAYMENT_PLANS[payload]
-            send_invoice(user_id, plan["title"], f"Dialog Spy Bot — {plan['title'].lower()} доступа", payload, plan["stars"])
+            result = send_invoice(user_id, plan["title"], f"Dialog Spy Bot — {plan['title'].lower()} доступа", payload, plan["stars"])
+            if result.get("ok"):
+                track_funnel_event(user_id, "invoice_created")
 
     # ── Pre-checkout ───────────────────────────────────────
     elif "pre_checkout_query" in update:
@@ -3092,6 +3183,7 @@ def handle_update(update: dict):
         db.save_user(owner_id, owner.get("username", ""), owner.get("first_name", ""))
         db.save_connection(bc["id"], owner_id, is_enabled)
         if is_enabled:
+            track_funnel_event(owner_id, "connected")
             referrer_id = db.reward_referral_for_connection(owner_id)
             if referrer_id:
                 send(

@@ -230,6 +230,15 @@ def init_db():
             )
         """)
         c.execute("CREATE INDEX IF NOT EXISTS idx_connection_reminders_due ON connection_reminders (next_at)")
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS funnel_events (
+                user_id BIGINT NOT NULL,
+                event TEXT NOT NULL,
+                first_at BIGINT NOT NULL,
+                PRIMARY KEY (user_id, event)
+            )
+        """)
+        c.execute("CREATE INDEX IF NOT EXISTS idx_funnel_event_time ON funnel_events (event, first_at)")
         c.execute("ALTER TABLE connection_reminders ADD COLUMN IF NOT EXISTS last_attempt_at BIGINT")
         c.execute("UPDATE connection_reminders SET last_attempt_at = next_at - 129600 WHERE attempts > 0 AND last_attempt_at IS NULL")
         c.execute("""
@@ -608,6 +617,36 @@ def record_useful_result(user_id, source_key, now_ts):
         release_conn(conn)
 
 
+def record_funnel_event(user_id, event, now_ts):
+    conn = get_conn()
+    try:
+        with conn:
+            with conn.cursor() as c:
+                c.execute("""
+                    INSERT INTO funnel_events (user_id, event, first_at) VALUES (%s, %s, %s)
+                    ON CONFLICT(user_id, event) DO NOTHING
+                """, (user_id, event, now_ts))
+    finally:
+        release_conn(conn)
+
+
+def get_funnel_report(since_ts, admin_id):
+    conn = get_conn()
+    try:
+        with conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as c:
+                c.execute("""
+                    SELECT e.event, COUNT(*) AS users
+                    FROM funnel_events s JOIN funnel_events e ON e.user_id = s.user_id
+                    WHERE s.event = 'start' AND s.first_at >= %s AND s.user_id <> %s
+                      AND e.first_at >= s.first_at
+                    GROUP BY e.event
+                """, (since_ts, admin_id))
+                return {row["event"]: row["users"] for row in c.fetchall()}
+    finally:
+        release_conn(conn)
+
+
 def get_referral_reminder_candidates(now_ts, admin_id):
     now = datetime.fromtimestamp(now_ts, MSK).replace(tzinfo=None)
     conn = get_conn()
@@ -620,9 +659,11 @@ def get_referral_reminder_candidates(now_ts, admin_id):
                     WHERE u.user_id <> %s AND NOT u.bot_blocked AND u.sub_type <> 'banned'
                       AND EXISTS (SELECT 1 FROM connections c WHERE c.owner_id = u.user_id AND c.is_enabled = 1)
                       AND (u.sub_expires <= %s OR (u.sub_expires IS NULL AND COALESCE(u.sub_remaining_seconds, 0) <= 0))
-                      AND (r.last_attempt_at IS NULL OR r.last_attempt_at <= %s)
+                      AND (r.last_attempt_at IS NULL OR r.last_attempt_at <= %s OR
+                           (u.sub_expires <= %s AND u.sub_expires > %s AND (r.last_expired_at IS NULL OR
+                            r.observed_expires IS NULL OR r.observed_expires <> u.sub_expires)))
                     ORDER BY u.user_id
-                """, (admin_id, now + timedelta(days=1), now_ts - 86400))
+                """, (admin_id, now + timedelta(days=1), now_ts - 86400, now, now - timedelta(days=1)))
                 return [row[0] for row in c.fetchall()]
     finally:
         release_conn(conn)
@@ -689,12 +730,16 @@ def claim_referral_reminder(user_id, now_ts, manual=False, expected_last_attempt
                 else:
                     state["inactive_since"] = state.get("inactive_since") or expires or now
                     due = (state.get("last_expired_at") or state["inactive_since"]) + timedelta(days=5)
-                    if manual or now >= due:
+                    if not manual and expires and not state.get("last_expired_at"):
+                        kind = "trial_expired" if user["sub_type"] == "trial" else "expired_now"
+                    elif manual or now >= due:
                         kind = "expired"
                 c.execute("SELECT last_attempt_at FROM connection_reminders WHERE user_id = %s", (user_id,))
                 other = c.fetchone()
                 recent = [None if manual else state.get("last_attempt_at"), other["last_attempt_at"] if other else None]
-                if any(stamp is not None and stamp > now_ts - 86400 for stamp in recent):
+                # The initial expiry notice must not be postponed by yesterday's warning.
+                fresh_expiry = kind in ("trial_expired", "expired_now") and expires > now - timedelta(days=1)
+                if not fresh_expiry and any(stamp is not None and stamp > now_ts - 86400 for stamp in recent):
                     kind = None
                 if kind:
                     state["last_attempt_at"] = now_ts
@@ -730,7 +775,7 @@ def referral_reminder_allowed(user_id, kind, expected_expires, now_ts):
         return False
     if kind == "expiring":
         return expires is not None and now < expires <= now + timedelta(days=1)
-    return kind == "expired" and (expires <= now if expires else int(user.get("sub_remaining_seconds") or 0) <= 0)
+    return kind in ("expired", "trial_expired", "expired_now") and (expires <= now if expires else int(user.get("sub_remaining_seconds") or 0) <= 0)
 
 
 def get_all_users():
@@ -840,9 +885,10 @@ def grant_channel_trial_once(user_id: int, days: int = 7) -> bool:
         if isinstance(user, dict):
             sub_type = user.get("sub_type")
             expires = user.get("sub_expires")
+            stored_seconds = int(user.get("sub_remaining_seconds") or 0)
             trial_granted = user.get("channel_trial_granted")
         else:
-            sub_type, expires, _remaining_seconds, trial_granted = user
+            sub_type, expires, stored_seconds, trial_granted = user
 
         if trial_granted or sub_type == "banned":
             conn.commit()
@@ -851,11 +897,12 @@ def grant_channel_trial_once(user_id: int, days: int = 7) -> bool:
         c.execute("SELECT COUNT(*) FROM connections WHERE owner_id = %s AND is_enabled = 1", (user_id,))
         active_connections = c.fetchone()[0]
         remaining_seconds = max(0, int(days * 24 * 60 * 60))
-        has_active_subscription = False
+        # Opening the bot must not replace an existing paused subscription with a trial.
+        has_active_subscription = int(stored_seconds or 0) > 0
         if active_connections and expires:
             if isinstance(expires, str):
                 expires = datetime.strptime(expires[:19], "%Y-%m-%d %H:%M:%S")
-            has_active_subscription = now_msk() < expires
+            has_active_subscription = has_active_subscription or now_msk() < expires
 
         if has_active_subscription:
             c.execute("""
