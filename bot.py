@@ -25,6 +25,7 @@ from zoneinfo import ZoneInfo
 
 sys.path.insert(0, os.path.dirname(__file__))
 import database as db
+from db_backup import encrypted_backup, open_archive, restore_empty, BackupError
 from config import BOT_TOKEN, ADMIN_ID, PORT
 from config import (
     PLATEGA_API_URL,
@@ -37,6 +38,11 @@ from config import (
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
+_DB_EXPORT_LOCK = threading.Lock()
+_DB_EXPORT_LAST_ATTEMPT = 0.0
+DB_IMPORT_MODE = os.getenv("DB_IMPORT_MODE", "0") == "1"
+_DB_IMPORT_STATE = None
+DB_IMPORT_MAX_BYTES = 20_000_000
 
 BASE = f"https://api.telegram.org/bot{BOT_TOKEN}"
 TELEGRAM_FILE_BASE = f"https://api.telegram.org/file/bot{BOT_TOKEN}"
@@ -447,6 +453,9 @@ class HealthHandler(BaseHTTPRequestHandler):
         if path != "/platega-webhook":
             self.respond(404, b"not found")
             return
+        if DB_IMPORT_MODE:
+            self.respond(503, b"database restore in progress")
+            return
         if not PLATEGA_MERCHANT_ID or not PLATEGA_SECRET:
             self.respond(503, b"payment integration is not configured")
             return
@@ -832,6 +841,189 @@ def send(chat_id, text, keyboard=None):
     if not result.get("ok"):
         logging.error("sendMessage failed for chat_id=%s", chat_id)
     return result
+
+
+def run_db_export():
+    try:
+        with encrypted_backup(db.DATABASE_URL, db.APP_MASTER_KEY) as path:
+            result = send_local_file(
+                ADMIN_ID, path, "document",
+                caption="🔐 Зашифрованная копия данных БД (формат v1). Не пересылай её другим людям.\n"
+                        "Для восстановления нужен прежний APP_MASTER_KEY и эта версия кода. "
+                        "Ключ в файл не включён. Это снимок на момент начала экспорта.",
+            )
+            if not result.get("ok"):
+                send(ADMIN_ID, "Отправка бэкапа не подтверждена. Проверь, пришёл ли файл; "
+                     "если нет — повтори /db_export через минуту.")
+    except Exception as exc:
+        # Never expose database credentials or cached message contents in logs.
+        logging.error("Database export failed: %s", type(exc).__name__)
+        reason = (" Проверь APP_MASTER_KEY, DATABASE_URL и доступность базы."
+                  if not isinstance(exc, BackupError) else " " + str(exc))
+        try:
+            send(ADMIN_ID, "Не удалось создать бэкап." + reason)
+        except Exception:
+            logging.error("Database export error notification failed")
+    finally:
+        _DB_EXPORT_LOCK.release()
+
+
+def start_db_export():
+    global _DB_EXPORT_LAST_ATTEMPT
+    if not _DB_EXPORT_LOCK.acquire(blocking=False):
+        send(ADMIN_ID, "Бэкап уже создаётся. Дождись результата.")
+        return
+    if _DB_EXPORT_LAST_ATTEMPT and time.monotonic() - _DB_EXPORT_LAST_ATTEMPT < 60:
+        _DB_EXPORT_LOCK.release()
+        send(ADMIN_ID, "Повторить экспорт можно через минуту после предыдущего запуска.")
+        return
+    previous_attempt = _DB_EXPORT_LAST_ATTEMPT
+    try:
+        _DB_EXPORT_LAST_ATTEMPT = time.monotonic()
+        send(ADMIN_ID, "⏳ Создаю зашифрованную резервную копию данных базы...")
+        threading.Thread(target=run_db_export, name="db-export", daemon=True).start()
+    except Exception:
+        _DB_EXPORT_LAST_ATTEMPT = previous_attempt
+        _DB_EXPORT_LOCK.release()
+        raise
+
+
+def clear_db_import():
+    global _DB_IMPORT_STATE
+    state, _DB_IMPORT_STATE = _DB_IMPORT_STATE, None
+    if state and state.get("path"):
+        try:
+            os.unlink(state["path"])
+        except FileNotFoundError:
+            pass
+
+
+def expire_db_import():
+    if _DB_IMPORT_STATE and time.monotonic() >= _DB_IMPORT_STATE["expires"]:
+        clear_db_import()
+
+
+def handle_db_import_update(update):
+    global _DB_IMPORT_STATE
+    msg = update.get("message", {})
+    cq = update.get("callback_query", {})
+    sender = (cq or msg).get("from", {}).get("id")
+    chat = (cq.get("message", {}) if cq else msg).get("chat", {}).get("id")
+    if sender != ADMIN_ID or chat != ADMIN_ID:
+        return
+    expire_db_import()
+    text = msg.get("text", "").strip()
+    command = text.split(maxsplit=1)[0] if text else ""
+    if "@" in command:
+        command, username = command.split("@", 1)
+        if username.lower() != BOT_USERNAME.lower():
+            return
+    data = cq.get("data", "")
+    if cq and not data.startswith("dbimport:"):
+        return
+    if cq:
+        api("answerCallbackQuery", callback_query_id=cq["id"])
+    if not DB_IMPORT_MODE:
+        send(ADMIN_ID, "Импорт выключен. Для новой пустой базы включи DB_IMPORT_MODE=1 "
+             "в Railway и перезапусти сервис. Старую копию бота сначала останови. "
+             "Не включай этот режим на рабочей базе.")
+        return
+    if command == "/cancel" or data == "dbimport:cancel":
+        clear_db_import()
+        send(ADMIN_ID, "Импорт отменён. База не изменена. Режим восстановления остаётся включён.")
+        return
+    if command == "/db_import":
+        clear_db_import()
+        _DB_IMPORT_STATE = {"expires": time.monotonic() + 600}
+        send(ADMIN_ID, "Отправь новым сообщением файл .enc, созданный текущим /db_export, "
+             "в течение 10 минут. Лимит загрузки через Telegram — 20 МБ.\n\n"
+             "На новом сервисе должен быть прежний APP_MASTER_KEY. "
+             "База назначения должна быть пустой; существующие данные не удаляются. "
+             "После проверки потребуется подтверждение. Отмена: /cancel.")
+        return
+    if msg.get("document"):
+        if not _DB_IMPORT_STATE:
+            send(ADMIN_ID, "Сначала отправь /db_import.")
+            return
+        document = msg["document"]
+        size = document.get("file_size")
+        if (not str(document.get("file_name", "")).lower().endswith(".enc")
+                or not document.get("file_id") or not isinstance(size, int)
+                or not 0 < size <= DB_IMPORT_MAX_BYTES):
+            send(ADMIN_ID, "Нужен файл .enc размером до 20 МБ. Большие бэкапы восстанавливаются отдельным скриптом.")
+            return
+        clear_db_import()
+        path = None
+        try:
+            send(ADMIN_ID, "Проверяю шифрование, формат и целостность бэкапа...")
+            info = api("getFile", file_id=document["file_id"])
+            path = download_file_from_info(info, "document", max_bytes=DB_IMPORT_MAX_BYTES)
+            if not path:
+                raise BackupError("Backup download failed")
+            archive, manifest = open_archive(path, db.APP_MASTER_KEY)
+            archive.close()
+            token = uuid.uuid4().hex
+            _DB_IMPORT_STATE = {"expires": time.monotonic() + 600, "path": path, "token": token}
+            path = None
+            send(ADMIN_ID,
+                 "🔐 Бэкап проверен.\n"
+                 f"Дата: {escape_html(str(manifest['created_at']), 80)}\n"
+                 f"Таблиц: {len(manifest['tables'])}\n\n"
+                 "Восстановить в базу, подключённую к этому сервису? "
+                 "Если в ней есть хотя бы одна запись, импорт будет отклонён.",
+                 keyboard={"inline_keyboard": [
+                     [{"text": "Восстановить в пустую БД", "callback_data": f"dbimport:confirm:{token}"}],
+                     [{"text": "Отмена", "callback_data": "dbimport:cancel"}],
+                 ]})
+        except Exception as exc:
+            clear_db_import()
+            logging.error("Backup validation failed: %s", type(exc).__name__)
+            send(ADMIN_ID, "Файл не принят: проверь APP_MASTER_KEY и используй новый бэкап формата v1. "
+                 "Старые .enc неизвестного формата не поддерживаются. База не изменена. Начни с /db_import.")
+        finally:
+            if path:
+                os.unlink(path)
+        return
+    if data.startswith("dbimport:confirm:"):
+        state = _DB_IMPORT_STATE
+        if not state or not state.get("token") or data != "dbimport:confirm:" + state["token"]:
+            send(ADMIN_ID, "Подтверждение устарело. Начни с /db_import.")
+            return
+        # Consume the token before any database write; duplicate callbacks cannot import twice.
+        _DB_IMPORT_STATE = None
+        restored = False
+        try:
+            archive, manifest = open_archive(state["path"], db.APP_MASTER_KEY)
+            with archive:
+                connection = db.get_conn()
+                try:
+                    restore_empty(connection, archive, manifest)
+                    restored = True
+                finally:
+                    db.release_conn(connection)
+        except Exception as exc:
+            logging.error("Database import failed: %s", type(exc).__name__)
+        finally:
+            os.unlink(state["path"])
+        if restored:
+            send(ADMIN_ID, "✅ Данные восстановлены. Режим восстановления пока включён.\n"
+                 "Проверь настройки нового сервиса и адрес callback Platega, затем выставь "
+                 "DB_IMPORT_MODE=0 и перезапусти сервис. Старую копию бота не запускай одновременно.")
+        else:
+            send(ADMIN_ID, "Импорт не выполнен. Проверь, что база пустая, версия схемы совпадает "
+                 "с бэкапом, а база доступна. Существующие данные не удалялись. Повтор: /db_import.")
+        return
+    if command:
+        send(ADMIN_ID, "Включён режим восстановления. Команды: /db_import и /cancel.")
+
+
+def process_db_import_updates(updates, seen):
+    expire_db_import()
+    for update in updates:
+        update_id = update.get("update_id")
+        if update_id not in seen:
+            handle_db_import_update(update)
+            seen.add(update_id)
 
 
 def send_photo(chat_id, photo_path, caption="", keyboard=None):
@@ -2226,6 +2418,12 @@ def get_chat_link(chat: dict) -> str:
 
 
 def handle_update(update: dict):
+    if DB_IMPORT_MODE:
+        handle_db_import_update(update)
+        return
+    if update.get("callback_query", {}).get("data", "").startswith("dbimport:"):
+        handle_db_import_update(update)
+        return
     global _REMINDER_BROADCAST_RUNNING
     logging.info(f"UPDATE: {list(update.keys())}")
 
@@ -2306,6 +2504,15 @@ def handle_update(update: dict):
         user_id = user.get("id")
         if not user_id:
             logging.warning("Message without sender user_id ignored")
+            return
+
+        if command == "/db_export":
+            if user_id == ADMIN_ID and chat_id == ADMIN_ID:
+                start_db_export()
+            return
+
+        if command == "/db_import":
+            handle_db_import_update(update)
             return
 
         if command == "/start" and chat_id == user_id and user_id != ADMIN_ID:
@@ -2776,6 +2983,8 @@ def handle_update(update: dict):
                 f"/payments user_id|@user — история оплат пользователя\n"
                 f"/ads — рекламные ссылки и статистика\n"
                 f"/funnel — воронка от запуска до оплаты\n"
+                f"/db_export — зашифрованная резервная копия данных БД (только в личке)\n"
+                f"/db_import — восстановление в пустую БД (DB_IMPORT_MODE=1)\n"
                 f"/bd [текст] — рассылка всем пользователям (alias /broadcast)\n"
                 f"/bdsub [текст] — рассылка только активным подписчикам\n"
                 f"/bdconn [текст] — рассылка только подключённым\n"
@@ -3435,27 +3644,38 @@ def main():
         raise RuntimeError("DATABASE_URL is not set")
 
     db.init_db()
-    db.cleanup_temp_tables()
+    if not DB_IMPORT_MODE:
+        db.cleanup_temp_tables()
     start_health_server()
-    start_cleanup_worker()
+    if not DB_IMPORT_MODE:
+        start_cleanup_worker()
 
     api("deleteWebhook", drop_pending_updates=False)
 
     me = api("getMe")
     BOT_USERNAME = me.get("result", {}).get("username", "DialogDelBot")
     setup_command_menu()
-    start_connection_reminder_worker()
+    if not DB_IMPORT_MODE:
+        start_connection_reminder_worker()
 
     print("=" * 40)
     print(f"Бот @{BOT_USERNAME} запущен!")
     print("=" * 40)
 
     offset = 0
+    import_seen = set()
     while True:
         try:
             result = api("getUpdates", offset=offset, timeout=50, allowed_updates=ALLOWED_UPDATES)
             if not result.get("ok"):
                 time.sleep(5)
+                continue
+
+            if DB_IMPORT_MODE:
+                # Keep offset=0 so payments/business events remain unacknowledged
+                # for the normal process after the operator disables restore mode.
+                process_db_import_updates(result.get("result", []), import_seen)
+                time.sleep(1)
                 continue
 
             for update in result.get("result", []):
