@@ -65,6 +65,8 @@ PLATEGA_MONTHLY_PLAN_ID = "platega_monthly"
 PLATEGA_MONTHLY_DAYS = 30
 PLATEGA_MONTHLY_AMOUNT = 120
 PLATEGA_SBP_METHOD = 2
+PLATEGA_CRYPTO_METHOD = 13
+PLATEGA_CRYPTO_PLAN_ID = "platega_crypto_monthly"
 MENU_ACTION_TEXTS = {
     "📊 Статус",
     "Статус",
@@ -407,7 +409,7 @@ def tariffs_page() -> bytes:
 <p>Дата последнего обновления: 12.09.2026</p>
 <p>Сервис <b>{html.escape(PROJECT_NAME)}</b> предоставляет доступ к уведомлениям об удалённых и изменённых сообщениях Telegram Business.</p>
 <h2>Оплата в рублях</h2>
-<p><b>30 дней — 120 ₽.</b> Оплата проводится через Platega по СБП / QR-коду. Подписка активируется автоматически после подтверждения оплаты.</p>
+<p><b>30 дней — 120 ₽.</b> Оплата проводится через Platega по СБП / QR-коду или криптовалютой. Сумма в криптовалюте и доступные сети отображаются на странице Platega. Подписка активируется автоматически после подтверждения оплаты.</p>
 <h2>Оплата Telegram Stars</h2>
 <p>1 день — {PRICE_DAILY} Stars.<br>7 дней — {PRICE_WEEKLY} Stars.<br>30 дней — {PRICE_MONTHLY} Stars.<br>365 дней — {PRICE_YEARLY} Stars.</p>
 <h2>Поддержка</h2>
@@ -1367,7 +1369,7 @@ def payment_report_view(user_id=None, page=1):
             f"После возвратов: {gross - refunded:,}\n"
             f"Плательщиков: {total.get('payers', 0)}\n"
         )
-    lines.append("<i>Суммы по базе, без вычета комиссий. Неоплаченные счета в итог не входят.</i>\n")
+    lines.append("<i>Суммы по базе, без вычета комиссий. Криптооплаты Platega учитываются по цене счёта в рублях. Неоплаченные счета в итог не входят.</i>\n")
     heading = "Последние операции" if report["page"] == 1 else "История операций"
     lines.append(f"<b>{heading}</b> · {report['page']}/{report['pages']} · всего {report['total']}")
     statuses = {"PAID": "Оплачено", "REFUNDED": "Возврат", "PENDING": "Ожидает оплаты",
@@ -1382,7 +1384,7 @@ def payment_report_view(user_id=None, page=1):
         lines.append(
             f"\n<b>{row['amount']:,} {unit} · {status}</b>\n"
             f"{name} · <code>{row['user_id']}</code> · {date}\n"
-            f"Тариф: {escape_html(row['plan'], 40)}\n"
+            f"Тариф: {escape_html('30 дней · криптовалюта (Platega)' if row['plan'] == PLATEGA_CRYPTO_PLAN_ID else row['plan'], 40)}\n"
             f"ID: <code>{escape_html(row['transaction_id'], 120)}</code>"
         )
         if row.get("refunded_at"):
@@ -1977,9 +1979,11 @@ def run_referral_reminders_once():
 def send_subscription_options(chat_id):
     result = send(chat_id,
         f"💳 <b>Купить подписку</b>\n\n⭐ <b>Telegram Stars:</b>\n"
-        f"{stars_plan_lines('Telegram Stars')}\n\n💳 СБП / QR через Platega: 30 дней — 120 ₽",
+        f"{stars_plan_lines('Telegram Stars')}\n\n💳 СБП / QR через Platega: 30 дней — 120 ₽\n"
+        "🪙 Криптовалюта через Platega: 30 дней — эквивалент 120 ₽",
         keyboard={"inline_keyboard": stars_plan_keyboard_rows() + [
             [{"text": "💳 30 дней — 120 ₽ (СБП / QR)", "callback_data": "buy_platega_monthly", "style": "success"}],
+            [{"text": "🪙 30 дней — 120 ₽ (криптовалюта)", "callback_data": "buy_platega_crypto", "style": "success"}],
         ]})
     if result.get("ok"):
         track_funnel_event(chat_id, "subscription_view")
@@ -2003,29 +2007,22 @@ def platega_is_configured() -> bool:
     return bool(PLATEGA_MERCHANT_ID and PLATEGA_SECRET and PUBLIC_BASE_URL)
 
 
-def create_platega_payment(user_id: int) -> tuple[str | None, str | None]:
+def create_platega_payment(user_id: int, payment_method: int = PLATEGA_SBP_METHOD) -> tuple[str | None, str | None]:
+    if payment_method not in (PLATEGA_SBP_METHOD, PLATEGA_CRYPTO_METHOD):
+        return None, "Неизвестный способ оплаты. Открой тарифы заново."
     if not platega_is_configured():
-        return None, "Оплата рублями временно недоступна. Попробуй Telegram Stars или напиши в поддержку."
+        return None, "Оплата через Platega временно недоступна. Попробуй Telegram Stars или напиши в поддержку."
 
-    transaction_id = str(uuid.uuid4())
+    plan_id = PLATEGA_CRYPTO_PLAN_ID if payment_method == PLATEGA_CRYPTO_METHOD else PLATEGA_MONTHLY_PLAN_ID
     try:
-        db.create_platega_payment(
-            transaction_id=transaction_id,
-            user_id=user_id,
-            plan_id=PLATEGA_MONTHLY_PLAN_ID,
-            amount=PLATEGA_MONTHLY_AMOUNT,
-            currency="RUB",
-            days=PLATEGA_MONTHLY_DAYS,
-            payment_method=PLATEGA_SBP_METHOD,
-        )
         request_payload = {
-            "paymentMethod": PLATEGA_SBP_METHOD,
-            "id": transaction_id,
+            "paymentMethod": payment_method,
             "paymentDetails": {"amount": PLATEGA_MONTHLY_AMOUNT, "currency": "RUB"},
             "description": f"{PROJECT_NAME}: подписка на {PLATEGA_MONTHLY_DAYS} дней",
             "return": public_url("/payment/success"),
             "failedUrl": public_url("/payment/failed"),
-            "payload": f"subscription:{user_id}:{PLATEGA_MONTHLY_PLAN_ID}",
+            "payload": f"subscription:{user_id}:{plan_id}",
+            "metadata": {"userId": str(user_id)},
         }
         req = urllib.request.Request(
             f"{PLATEGA_API_URL}/transaction/process",
@@ -2039,13 +2036,23 @@ def create_platega_payment(user_id: int) -> tuple[str | None, str | None]:
         )
         with urllib.request.urlopen(req, timeout=20) as response:
             result = json.loads(response.read().decode("utf-8"))
-        redirect_url = str(result.get("redirect", "")).strip()
-        provider_transaction_id = str(result.get("transactionId", transaction_id)).strip()
-        if not redirect_url or provider_transaction_id != transaction_id:
+        redirect_url = str(result.get("redirect") or "").strip()
+        transaction_id = str(result.get("transactionId") or "").strip()
+        parsed_url = urllib.parse.urlparse(redirect_url)
+        if parsed_url.scheme != "https" or not parsed_url.hostname or not transaction_id:
             raise ValueError("Platega returned an invalid payment link")
+        # Persist the provider's ID before exposing a payable link to the user.
+        db.create_platega_payment(
+            transaction_id=transaction_id,
+            user_id=user_id,
+            plan_id=plan_id,
+            amount=PLATEGA_MONTHLY_AMOUNT,
+            currency="RUB",
+            days=PLATEGA_MONTHLY_DAYS,
+            payment_method=payment_method,
+        )
         return redirect_url, None
     except Exception as exc:
-        db.mark_platega_payment_failed(transaction_id)
         logging.error("Platega payment creation failed for user_id=%s: %s", user_id, exc)
         return None, "Не удалось создать счёт. Попробуй ещё раз через минуту или напиши в поддержку."
 
@@ -2080,7 +2087,9 @@ def expired_details_text(user_id: int, event_type: str = "deleted", chat_link: s
         "⭐ <b>Оплата через Telegram Stars:</b>\n"
         f"{stars_plan_lines()}\n\n"
         "💳 <b>Оплата в рублях через СБП / QR:</b>\n"
-        "• 30 дней — 120 ₽"
+        "• 30 дней — 120 ₽\n\n"
+        "🪙 <b>Оплата криптовалютой через Platega:</b>\n"
+        "• 30 дней — эквивалент 120 ₽"
     )
 
 
@@ -2088,6 +2097,7 @@ def expired_payment_keyboard(user_id: int):
     return {
         "inline_keyboard": stars_plan_keyboard_rows() + [
             [{"text": "💳 30 дней — 120 ₽ (СБП / QR)", "callback_data": "buy_platega_monthly", "style": "success"}],
+            [{"text": "🪙 30 дней — 120 ₽ (криптовалюта)", "callback_data": "buy_platega_crypto", "style": "success"}],
             [{"text": "🎁 Пригласить друга +3 дня", "url": referral_share_url(user_id)}],
         ]
     }
@@ -3120,20 +3130,26 @@ def handle_update(update: dict):
                 else:
                     send(user_id, "Не удалось подтвердить показ сообщения. Медиа могло уже прийти или стать недоступным. "
                          "Если отправка зависла, нажми «Показать сообщение» ещё раз через 15 минут.")
-        elif data == "buy_platega_monthly":
+        elif data in ("buy_platega_monthly", "buy_platega_crypto"):
             if cq.get("message", {}).get("chat", {}).get("id") != user_id:
                 return
             track_funnel_event(user_id, "checkout_started")
-            payment_url, error_message = create_platega_payment(user_id)
+            crypto = data == "buy_platega_crypto"
+            payment_method = PLATEGA_CRYPTO_METHOD if crypto else PLATEGA_SBP_METHOD
+            payment_url, error_message = create_platega_payment(user_id, payment_method)
             if not payment_url:
                 send(user_id, f"❌ {error_message}", keyboard=main_keyboard())
                 return
+            instructions = (
+                "Открой страницу Platega и выбери доступную криптовалюту и сеть. "
+                "Итоговая сумма и реквизиты будут указаны там. "
+                if crypto else "Открой страницу оплаты, отсканируй QR-код или оплати через СБП. "
+            )
             result = send(
                 user_id,
                 "💳 <b>Оплата 30 дней — 120 ₽</b>\n\n"
-                "Открой страницу оплаты, отсканируй QR-код или оплати через СБП. "
-                "После подтверждения подписка активируется автоматически.",
-                keyboard={"inline_keyboard": [[{"text": "Оплатить 120 ₽", "url": payment_url, "style": "success"}]]},
+                + instructions + "После подтверждения подписка активируется автоматически.",
+                keyboard={"inline_keyboard": [[{"text": "Оплатить криптовалютой" if crypto else "Оплатить 120 ₽", "url": payment_url, "style": "success"}]]},
             )
             if result.get("ok"):
                 track_funnel_event(user_id, "invoice_created")
