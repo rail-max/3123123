@@ -1936,7 +1936,8 @@ def referral_reminder_view(user_id, kind, expires=None):
         text = (
             "⏳ <b>Подписка скоро закончится</b>\n\n"
             f"Доступ активен до <b>{expires:%d.%m.%Y %H:%M} МСК</b>.\n\n"
-            "💳 Продли подписку или получи <b>3 дня бесплатно</b> за друга.\n\n"
+            "💳 Продли подписку через СБП, криптовалюту или Telegram Stars, "
+            "либо получи <b>3 дня бесплатно</b> за друга.\n\n"
             "🎁 Другу нужно перейти по твоей ссылке и подключить бота к своим чатам. "
             "После подключения тебе начислятся <b>+3 дня</b>."
         )
@@ -1946,14 +1947,16 @@ def referral_reminder_view(user_id, kind, expires=None):
             f"<b>{title}</b>\n\n"
             "Бот всё ещё подключён к твоим чатам и продолжает отслеживать доступные сообщения по твоим настройкам.\n\n"
             "Чтобы снова видеть содержимое удалённых и изменённых сообщений, продли доступ.\n\n"
-            f"💳 <b>Продлить на {PLATEGA_MONTHLY_DAYS} дней — {PLATEGA_MONTHLY_AMOUNT} ₽</b>\n\n"
+            f"💳 <b>Продлить на {PLATEGA_MONTHLY_DAYS} дней — {PLATEGA_MONTHLY_AMOUNT} ₽</b>\n"
+            "Оплата через СБП или криптовалюту. Также доступны тарифы в Telegram Stars.\n\n"
             "🎁 Или пригласи друга и получи <b>+3 дня</b>.\n"
             "Другу нужно перейти по твоей ссылке и подключить бота к своим чатам. "
             "После подключения тебе начислятся <b>+3 дня</b>."
         )
     buttons = [
-        [{"text": f"💳 Продлить на {PLATEGA_MONTHLY_DAYS} дней — {PLATEGA_MONTHLY_AMOUNT} ₽", "callback_data": "buy_platega_monthly", "style": "success"}],
+        [{"text": f"💳 {PLATEGA_MONTHLY_DAYS} дней — {PLATEGA_MONTHLY_AMOUNT} ₽ (СБП / QR)", "callback_data": "buy_platega_monthly", "style": "success"}],
         [{"text": "⭐ Telegram Stars / другие тарифы", "callback_data": "referral:renew"}],
+        [{"text": f"🪙 {PLATEGA_MONTHLY_DAYS} дней — {PLATEGA_MONTHLY_AMOUNT} ₽ (криптовалюта)", "callback_data": "buy_platega_crypto", "style": "success"}],
         [invite],
     ]
     return text, {"inline_keyboard": buttons}
